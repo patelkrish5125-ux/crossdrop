@@ -1,6 +1,7 @@
 import type {
   ConnectionState,
   FileMetadata,
+  PeerDevice,
   ReceivedFile,
   TransferProgress,
 } from '../types/index.ts';
@@ -21,6 +22,36 @@ export interface WebRTCCallbacks {
   onProgress?: (progress: TransferProgress) => void;
   onFileReceived?: (file: ReceivedFile) => void;
   onError?: (error: string) => void;
+  onPeerInfo?: (peer: PeerDevice) => void;
+}
+
+class TransferSpeedTracker {
+  private lastTime = Date.now();
+  private lastBytes = 0;
+  private currentSpeed = 0;
+
+  public reset(initialBytes = 0) {
+    this.lastTime = Date.now();
+    this.lastBytes = initialBytes;
+    this.currentSpeed = 0;
+  }
+
+  public update(currentBytes: number, totalBytes: number): { speed: number; eta: number | null } {
+    const now = Date.now();
+    const elapsed = (now - this.lastTime) / 1000;
+
+    if (elapsed >= 0.25) {
+      const deltaBytes = Math.max(0, currentBytes - this.lastBytes);
+      const instantSpeed = deltaBytes / elapsed;
+      this.currentSpeed = this.currentSpeed === 0 ? instantSpeed : this.currentSpeed * 0.65 + instantSpeed * 0.35;
+      this.lastTime = now;
+      this.lastBytes = currentBytes;
+    }
+
+    const remainingBytes = Math.max(0, totalBytes - currentBytes);
+    const eta = this.currentSpeed > 1000 ? Math.ceil(remainingBytes / this.currentSpeed) : null;
+    return { speed: Math.max(0, Math.round(this.currentSpeed)), eta };
+  }
 }
 
 export class WebRTCService {
@@ -31,13 +62,16 @@ export class WebRTCService {
   private iceCandidatesQueue: RTCIceCandidateInit[] = [];
   private isRemoteDescriptionSet = false;
 
-  // File sending state
+  private myDeviceName = 'Device';
   private isCancelled = false;
 
-  // File receiving state
+  // Receiving state
   private incomingMeta: FileMetadata | null = null;
+  private incomingOverallTotalBytes = 0;
+  private incomingOverallTransferredBytes = 0;
   private receivedChunks: ArrayBuffer[] = [];
   private receivedBytes = 0;
+  private receiverSpeedTracker = new TransferSpeedTracker();
 
   constructor(sendSignal: (signal: any) => void, callbacks: WebRTCCallbacks = {}) {
     this.sendSignalCallback = sendSignal;
@@ -48,12 +82,30 @@ export class WebRTCService {
     this.callbacks = { ...this.callbacks, ...callbacks };
   }
 
+  public setDeviceName(name: string) {
+    this.myDeviceName = name.trim() || 'Device';
+    this.sendPeerInfo();
+  }
+
+  private sendPeerInfo() {
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      try {
+        this.dataChannel.send(
+          JSON.stringify({
+            type: 'peer-info',
+            name: this.myDeviceName,
+          })
+        );
+      } catch {}
+    }
+  }
+
   public initConnection(isInitiator: boolean) {
     this.cleanup();
     this.isRemoteDescriptionSet = false;
     this.iceCandidatesQueue = [];
 
-    this.callbacks.onConnectionStateChange?.('Connecting');
+    this.callbacks.onConnectionStateChange?.('NEGOTIATING');
 
     try {
       this.peerConnection = new RTCPeerConnection(RTC_CONFIG);
@@ -73,17 +125,17 @@ export class WebRTCService {
         console.log(`[WebRTC] PeerConnection state: ${state}`);
 
         if (state === 'connected') {
-          // If channel is already open or opens soon
           if (this.dataChannel?.readyState === 'open') {
-            this.callbacks.onConnectionStateChange?.('Connected');
+            this.callbacks.onConnectionStateChange?.('CONNECTED');
+            this.sendPeerInfo();
           }
         } else if (state === 'disconnected') {
-          this.callbacks.onConnectionStateChange?.('Disconnected');
+          this.callbacks.onConnectionStateChange?.('DISCONNECTED');
         } else if (state === 'failed') {
-          this.callbacks.onConnectionStateChange?.('Error');
+          this.callbacks.onConnectionStateChange?.('ERROR');
           this.callbacks.onError?.('P2P connection failed. Network may restrict direct connections.');
         } else if (state === 'closed') {
-          this.callbacks.onConnectionStateChange?.('Disconnected');
+          this.callbacks.onConnectionStateChange?.('DISCONNECTED');
         }
       };
 
@@ -91,13 +143,12 @@ export class WebRTCService {
         if (!this.peerConnection) return;
         console.log(`[WebRTC] ICE state: ${this.peerConnection.iceConnectionState}`);
         if (this.peerConnection.iceConnectionState === 'failed') {
-          this.callbacks.onConnectionStateChange?.('Error');
-          this.callbacks.onError?.('Network connection failed. Could not establish P2P connection.');
+          this.callbacks.onConnectionStateChange?.('ERROR');
+          this.callbacks.onError?.('Network connection failed. Could not establish direct P2P connection.');
         }
       };
 
       if (isInitiator) {
-        // Initiator creates data channel and offer
         const dc = this.peerConnection.createDataChannel('file-transfer', {
           ordered: true,
         });
@@ -116,54 +167,59 @@ export class WebRTCService {
           })
           .catch((err) => {
             console.error('[WebRTC] Create offer error:', err);
+            this.callbacks.onConnectionStateChange?.('ERROR');
             this.callbacks.onError?.('Failed to initiate connection.');
           });
       } else {
-        // Joiner listens for data channel
         this.peerConnection.ondatachannel = (event) => {
-          console.log('[WebRTC] Received remote data channel');
+          console.log('[WebRTC] Receiver got remote data channel');
           this.setupDataChannel(event.channel);
         };
       }
     } catch (err: any) {
-      console.error('[WebRTC] Error initializing connection:', err);
-      this.callbacks.onError?.(err.message || 'Could not initialize WebRTC.');
+      console.error('[WebRTC] Exception during PeerConnection setup:', err);
+      this.callbacks.onConnectionStateChange?.('ERROR');
+      this.callbacks.onError?.('Failed to initialize WebRTC subsystem: ' + err.message);
     }
   }
 
-  private setupDataChannel(channel: RTCDataChannel) {
-    this.dataChannel = channel;
-    this.dataChannel.binaryType = 'arraybuffer';
-    this.dataChannel.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
+  private setupDataChannel(dc: RTCDataChannel) {
+    this.dataChannel = dc;
+    dc.binaryType = 'arraybuffer';
 
-    this.dataChannel.onopen = () => {
-      console.log('[WebRTC] DataChannel open');
-      this.callbacks.onConnectionStateChange?.('Connected');
+    dc.onopen = () => {
+      console.log('[WebRTC] DataChannel open & ready for file transfer');
+      this.callbacks.onConnectionStateChange?.('CONNECTED');
+      this.sendPeerInfo();
     };
 
-    this.dataChannel.onclose = () => {
+    dc.onclose = () => {
       console.log('[WebRTC] DataChannel closed');
-      this.callbacks.onConnectionStateChange?.('Disconnected');
+      this.callbacks.onConnectionStateChange?.('DISCONNECTED');
     };
 
-    this.dataChannel.onerror = (err) => {
-      console.error('[WebRTC] DataChannel error:', err);
-      this.callbacks.onError?.('Data channel error occurred.');
+    dc.onerror = (event) => {
+      console.error('[WebRTC] DataChannel error:', event);
+      this.callbacks.onConnectionStateChange?.('ERROR');
+      this.callbacks.onError?.('DataChannel error occurred during transfer.');
     };
 
-    this.dataChannel.onmessage = (event) => {
+    dc.onmessage = (event) => {
       this.handleIncomingMessage(event.data);
     };
   }
 
-  public async handleSignal(signal: any) {
-    if (!this.peerConnection) return;
+  public async handleSignal(signalData: any) {
+    if (!this.peerConnection) {
+      console.warn('[WebRTC] Received signal but PeerConnection is not initialized.');
+      return;
+    }
 
     try {
-      if (signal.type === 'offer') {
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      if (signalData.type === 'offer') {
+        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
         this.isRemoteDescriptionSet = true;
-        this.processQueuedCandidates();
+        await this.drainQueuedCandidates();
 
         const answer = await this.peerConnection.createAnswer();
         await this.peerConnection.setLocalDescription(answer);
@@ -172,143 +228,176 @@ export class WebRTCService {
           type: 'answer',
           sdp: this.peerConnection.localDescription,
         });
-      } else if (signal.type === 'answer') {
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      } else if (signalData.type === 'answer') {
+        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
         this.isRemoteDescriptionSet = true;
-        this.processQueuedCandidates();
-      } else if (signal.type === 'candidate') {
-        const candidate = new RTCIceCandidate(signal.candidate);
+        await this.drainQueuedCandidates();
+      } else if (signalData.type === 'candidate') {
+        const candidate = new RTCIceCandidate(signalData.candidate);
         if (this.isRemoteDescriptionSet) {
           await this.peerConnection.addIceCandidate(candidate);
         } else {
-          this.iceCandidatesQueue.push(candidate);
+          this.iceCandidatesQueue.push(signalData.candidate);
         }
       }
     } catch (err: any) {
-      console.error('[WebRTC] Error handling signal:', err);
-      this.callbacks.onError?.('Failed to process connection signal.');
+      console.error('[WebRTC] Error handling signal message:', err);
+      this.callbacks.onConnectionStateChange?.('ERROR');
+      this.callbacks.onError?.('Signaling negotiation failed: ' + err.message);
     }
   }
 
-  private processQueuedCandidates() {
-    if (!this.peerConnection) return;
+  private async drainQueuedCandidates() {
+    if (!this.peerConnection || !this.isRemoteDescriptionSet) return;
     while (this.iceCandidatesQueue.length > 0) {
-      const cand = this.iceCandidatesQueue.shift();
-      if (cand) {
-        this.peerConnection.addIceCandidate(cand).catch((err) => {
-          console.warn('[WebRTC] Error adding queued ICE candidate:', err);
+      const candidateInit = this.iceCandidatesQueue.shift();
+      if (candidateInit) {
+        await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidateInit)).catch((e) => {
+          console.warn('[WebRTC] Failed to add queued ICE candidate:', e);
         });
       }
     }
   }
 
   /**
-   * Transfer a file to the connected peer over RTCDataChannel
+   * Transfer one or multiple files sequentially over RTCDataChannel.
+   * Real-time transfer metrics (speed, ETA) are calculated per chunk.
    */
-  public async sendFile(file: File): Promise<void> {
+  public async sendFiles(files: File[]): Promise<void> {
     if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      throw new Error('Connection is not ready for transfer.');
+      throw new Error('P2P connection is not ready for transfer.');
     }
+    if (files.length === 0) return;
 
     this.isCancelled = false;
-    this.callbacks.onConnectionStateChange?.('Transferring');
+    this.callbacks.onConnectionStateChange?.('TRANSFERRING');
 
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const metadata: FileMetadata = {
-      id: `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-      name: file.name,
-      size: file.size,
-      mimeType: file.type || 'application/octet-stream',
-      totalChunks,
-      chunkSize: CHUNK_SIZE,
-    };
+    const totalFiles = files.length;
+    const overallTotalBytes = files.reduce((acc, f) => acc + f.size, 0);
+    let overallTransferredBytes = 0;
 
-    this.callbacks.onProgress?.({
-      status: 'preparing',
-      fileName: file.name,
-      transferredBytes: 0,
-      totalBytes: file.size,
-      percentage: 0,
-    });
+    const speedTracker = new TransferSpeedTracker();
+    speedTracker.reset(0);
 
-    // 1. Send file metadata header
-    this.dataChannel.send(
-      JSON.stringify({
-        type: 'file-meta',
-        meta: metadata,
-      })
-    );
+    for (let fileIndex = 0; fileIndex < totalFiles; fileIndex++) {
+      if (this.isCancelled) break;
 
-    let offset = 0;
-    let transferredBytes = 0;
+      const file = files[fileIndex];
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      const metadata: FileMetadata = {
+        id: `${Date.now()}-${fileIndex}-${Math.random().toString(36).substring(2, 7)}`,
+        name: file.name,
+        size: file.size,
+        mimeType: file.type || 'application/octet-stream',
+        totalChunks,
+        chunkSize: CHUNK_SIZE,
+        fileIndex,
+        totalFiles,
+      };
 
-    this.callbacks.onProgress?.({
-      status: 'sending',
-      fileName: file.name,
-      transferredBytes: 0,
-      totalBytes: file.size,
-      percentage: 0,
-    });
+      // 1. Send file metadata header
+      this.dataChannel.send(
+        JSON.stringify({
+          type: 'file-meta',
+          meta: metadata,
+          overallTotalBytes,
+          overallTransferredBytes,
+        })
+      );
 
-    // 2. Send chunks with backpressure handling
-    while (offset < file.size) {
-      if (this.isCancelled) {
-        this.dataChannel.send(
-          JSON.stringify({
-            type: 'transfer-cancel',
-            id: metadata.id,
-          })
-        );
+      let offset = 0;
+      let fileTransferredBytes = 0;
+
+      while (offset < file.size) {
+        if (this.isCancelled) {
+          this.dataChannel.send(
+            JSON.stringify({
+              type: 'transfer-cancel',
+              fileIndex,
+            })
+          );
+          this.callbacks.onProgress?.({
+            status: 'cancelled',
+            fileName: file.name,
+            fileIndex,
+            totalFiles,
+            transferredBytes: fileTransferredBytes,
+            totalBytes: file.size,
+            percentage: Math.round((fileTransferredBytes / Math.max(1, file.size)) * 100),
+            overallTransferredBytes,
+            overallTotalBytes,
+            overallPercentage: Math.round((overallTransferredBytes / Math.max(1, overallTotalBytes)) * 100),
+            speedBytesPerSec: 0,
+            etaSeconds: null,
+            error: 'Transfer cancelled by sender.',
+          });
+          this.callbacks.onConnectionStateChange?.('CONNECTED');
+          return;
+        }
+
+        // Backpressure flow control
+        if (this.dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
+          await this.waitForBufferDrain(this.dataChannel);
+        }
+
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const chunkBuffer = await slice.arrayBuffer();
+
+        this.dataChannel.send(chunkBuffer);
+
+        offset += CHUNK_SIZE;
+        const sentChunk = Math.min(CHUNK_SIZE, file.size - fileTransferredBytes);
+        fileTransferredBytes = Math.min(offset, file.size);
+        overallTransferredBytes += sentChunk;
+
+        const { speed, eta } = speedTracker.update(overallTransferredBytes, overallTotalBytes);
+
         this.callbacks.onProgress?.({
-          status: 'cancelled',
+          status: 'sending',
           fileName: file.name,
-          transferredBytes,
+          fileIndex,
+          totalFiles,
+          transferredBytes: fileTransferredBytes,
           totalBytes: file.size,
-          percentage: Math.round((transferredBytes / file.size) * 100),
+          percentage: Math.round((fileTransferredBytes / Math.max(1, file.size)) * 100),
+          overallTransferredBytes,
+          overallTotalBytes,
+          overallPercentage: Math.round((overallTransferredBytes / Math.max(1, overallTotalBytes)) * 100),
+          speedBytesPerSec: speed,
+          etaSeconds: eta,
         });
-        this.callbacks.onConnectionStateChange?.('Connected');
-        return;
       }
 
-      // Check backpressure
-      if (this.dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
-        await this.waitForBufferDrain(this.dataChannel);
-      }
+      if (this.isCancelled) break;
 
-      const slice = file.slice(offset, offset + CHUNK_SIZE);
-      const chunkBuffer = await slice.arrayBuffer();
-
-      this.dataChannel.send(chunkBuffer);
-
-      offset += CHUNK_SIZE;
-      transferredBytes = Math.min(offset, file.size);
+      // 2. Send file end marker
+      this.dataChannel.send(
+        JSON.stringify({
+          type: 'file-end',
+          id: metadata.id,
+          fileIndex,
+        })
+      );
 
       this.callbacks.onProgress?.({
-        status: 'sending',
+        status: fileIndex === totalFiles - 1 ? 'completed' : 'sending',
         fileName: file.name,
-        transferredBytes,
+        fileIndex,
+        totalFiles,
+        transferredBytes: file.size,
         totalBytes: file.size,
-        percentage: Math.round((transferredBytes / file.size) * 100),
+        percentage: 100,
+        overallTransferredBytes,
+        overallTotalBytes,
+        overallPercentage: Math.round((overallTransferredBytes / Math.max(1, overallTotalBytes)) * 100),
+        speedBytesPerSec: 0,
+        etaSeconds: 0,
       });
     }
 
-    // 3. Send file completion notification
-    this.dataChannel.send(
-      JSON.stringify({
-        type: 'file-end',
-        id: metadata.id,
-      })
-    );
-
-    this.callbacks.onProgress?.({
-      status: 'completed',
-      fileName: file.name,
-      transferredBytes: file.size,
-      totalBytes: file.size,
-      percentage: 100,
-    });
-
-    this.callbacks.onConnectionStateChange?.('Completed');
+    if (!this.isCancelled) {
+      this.callbacks.onConnectionStateChange?.('COMPLETED');
+    }
   }
 
   public cancelTransfer() {
@@ -325,24 +414,38 @@ export class WebRTCService {
     });
   }
 
-  /**
-   * Handle incoming messages on the RTCDataChannel
-   */
   private handleIncomingMessage(data: string | ArrayBuffer) {
     if (typeof data === 'string') {
       try {
         const msg = JSON.parse(data);
-        if (msg.type === 'file-meta') {
+        if (msg.type === 'peer-info') {
+          if (msg.name) {
+            this.callbacks.onPeerInfo?.({ name: msg.name });
+          }
+        } else if (msg.type === 'file-meta') {
           this.incomingMeta = msg.meta;
+          this.incomingOverallTotalBytes = msg.overallTotalBytes || this.incomingMeta!.size;
+          this.incomingOverallTransferredBytes = msg.overallTransferredBytes || 0;
           this.receivedChunks = [];
           this.receivedBytes = 0;
-          this.callbacks.onConnectionStateChange?.('Transferring');
+          this.receiverSpeedTracker.reset(this.incomingOverallTransferredBytes);
+
+          this.callbacks.onConnectionStateChange?.('TRANSFERRING');
           this.callbacks.onProgress?.({
             status: 'receiving',
             fileName: this.incomingMeta!.name,
+            fileIndex: this.incomingMeta!.fileIndex,
+            totalFiles: this.incomingMeta!.totalFiles,
             transferredBytes: 0,
             totalBytes: this.incomingMeta!.size,
             percentage: 0,
+            overallTransferredBytes: this.incomingOverallTransferredBytes,
+            overallTotalBytes: this.incomingOverallTotalBytes,
+            overallPercentage: Math.round(
+              (this.incomingOverallTransferredBytes / Math.max(1, this.incomingOverallTotalBytes)) * 100
+            ),
+            speedBytesPerSec: 0,
+            etaSeconds: null,
           });
         } else if (msg.type === 'file-end') {
           if (this.incomingMeta && this.receivedChunks.length > 0) {
@@ -352,25 +455,42 @@ export class WebRTCService {
             const url = URL.createObjectURL(blob);
 
             const receivedFile: ReceivedFile = {
+              id: this.incomingMeta.id,
               name: this.incomingMeta.name,
               size: this.incomingMeta.size,
               mimeType: this.incomingMeta.mimeType,
               blob,
               url,
+              receivedAt: Date.now(),
             };
 
+            const isLast = this.incomingMeta.fileIndex === this.incomingMeta.totalFiles - 1;
+
+            this.callbacks.onFileReceived?.(receivedFile);
             this.callbacks.onProgress?.({
-              status: 'completed',
+              status: isLast ? 'completed' : 'receiving',
               fileName: this.incomingMeta.name,
+              fileIndex: this.incomingMeta.fileIndex,
+              totalFiles: this.incomingMeta.totalFiles,
               transferredBytes: this.incomingMeta.size,
               totalBytes: this.incomingMeta.size,
               percentage: 100,
+              overallTransferredBytes: this.incomingOverallTransferredBytes,
+              overallTotalBytes: this.incomingOverallTotalBytes,
+              overallPercentage: isLast
+                ? 100
+                : Math.round(
+                    (this.incomingOverallTransferredBytes / Math.max(1, this.incomingOverallTotalBytes)) * 100
+                  ),
+              speedBytesPerSec: 0,
+              etaSeconds: 0,
             });
 
-            this.callbacks.onFileReceived?.(receivedFile);
-            this.callbacks.onConnectionStateChange?.('Completed');
+            if (isLast) {
+              this.callbacks.onConnectionStateChange?.('COMPLETED');
+            }
 
-            // Reset state
+            // Clear chunk buffers for next file in queue
             this.incomingMeta = null;
             this.receivedChunks = [];
             this.receivedBytes = 0;
@@ -382,31 +502,55 @@ export class WebRTCService {
           this.callbacks.onProgress?.({
             status: 'cancelled',
             fileName: 'Transfer',
+            fileIndex: 0,
+            totalFiles: 1,
             transferredBytes: 0,
             totalBytes: 0,
             percentage: 0,
+            overallTransferredBytes: 0,
+            overallTotalBytes: 0,
+            overallPercentage: 0,
+            speedBytesPerSec: 0,
+            etaSeconds: null,
             error: 'Sender cancelled the transfer.',
           });
-          this.callbacks.onConnectionStateChange?.('Connected');
+          this.callbacks.onConnectionStateChange?.('CONNECTED');
         }
       } catch (err) {
-        console.error('[WebRTC] Error parsing DataChannel string payload:', err);
+        console.error('[WebRTC] Error parsing DataChannel message:', err);
       }
     } else if (data instanceof ArrayBuffer) {
       if (!this.incomingMeta) return;
 
       this.receivedChunks.push(data);
       this.receivedBytes += data.byteLength;
+      this.incomingOverallTransferredBytes += data.byteLength;
 
       const total = this.incomingMeta.size;
       const percentage = total > 0 ? Math.min(100, Math.round((this.receivedBytes / total) * 100)) : 100;
+      const overallPercentage =
+        this.incomingOverallTotalBytes > 0
+          ? Math.min(100, Math.round((this.incomingOverallTransferredBytes / this.incomingOverallTotalBytes) * 100))
+          : 100;
+
+      const { speed, eta } = this.receiverSpeedTracker.update(
+        this.incomingOverallTransferredBytes,
+        this.incomingOverallTotalBytes
+      );
 
       this.callbacks.onProgress?.({
         status: 'receiving',
         fileName: this.incomingMeta.name,
+        fileIndex: this.incomingMeta.fileIndex,
+        totalFiles: this.incomingMeta.totalFiles,
         transferredBytes: this.receivedBytes,
         totalBytes: total,
         percentage,
+        overallTransferredBytes: this.incomingOverallTransferredBytes,
+        overallTotalBytes: this.incomingOverallTotalBytes,
+        overallPercentage,
+        speedBytesPerSec: speed,
+        etaSeconds: eta,
       });
     }
   }

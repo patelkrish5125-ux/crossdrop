@@ -1,7 +1,5 @@
 import { getSignalingConfig, getHealthCheckUrl } from '../config.ts';
-import type { SignalingClientMessage, SignalingServerMessage } from '../types/index.ts';
-
-export type SignalingConnectionStatus = 'connecting' | 'connected' | 'waking' | 'disconnected' | 'reconnecting';
+import type { ConnectionState, SignalingClientMessage, SignalingServerMessage } from '../types/index.ts';
 
 export interface SignalingCallbacks {
   onRoomCreated?: (roomId: string, code: string) => void;
@@ -11,7 +9,7 @@ export interface SignalingCallbacks {
   onPeerDisconnected?: (reason?: string) => void;
   onError?: (code: string, message: string) => void;
   onConnectionChange?: (connected: boolean, statusText?: string) => void;
-  onStatusChange?: (status: SignalingConnectionStatus, statusText?: string) => void;
+  onStateChange?: (state: ConnectionState, statusText?: string) => void;
 }
 
 export class SignalingClient {
@@ -21,6 +19,13 @@ export class SignalingClient {
   private isConnecting = false;
   private isWaking = false;
   private abortWaking = false;
+
+  // Reconnection state
+  private currentRoomCode: string | null = null;
+  private isIntentionalDisconnect = false;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  private reconnectTimer: any = null;
 
   constructor(serverUrl?: string) {
     if (serverUrl) {
@@ -43,11 +48,15 @@ export class SignalingClient {
     return this.isWaking;
   }
 
-  private notifyStatus(status: SignalingConnectionStatus, text?: string) {
-    this.callbacks.onStatusChange?.(status, text);
-    if (status === 'connected') {
+  public get activeRoomCode(): string | null {
+    return this.currentRoomCode;
+  }
+
+  private notifyState(state: ConnectionState, text?: string) {
+    this.callbacks.onStateChange?.(state, text);
+    if (state === 'SIGNALING_CONNECTED' || state === 'CONNECTED') {
       this.callbacks.onConnectionChange?.(true, text || 'Connected');
-    } else if (status === 'disconnected') {
+    } else if (state === 'DISCONNECTED' || state === 'ERROR') {
       this.callbacks.onConnectionChange?.(false, text || 'Disconnected');
     }
   }
@@ -60,7 +69,7 @@ export class SignalingClient {
     const startTime = Date.now();
     this.isWaking = true;
     this.abortWaking = false;
-    this.notifyStatus('waking', 'Waking up server (free tier cold start, ~30s)...');
+    this.notifyState('WAKING', 'Waking up server (Render free tier cold start ~30s)...');
     console.log(`[CrossDrop Signaling] Probing health endpoint at ${healthUrl} for server wake-up...`);
 
     while (Date.now() - startTime < maxWaitMs && !this.abortWaking) {
@@ -118,6 +127,8 @@ export class SignalingClient {
       return Promise.reject(new Error(errMsg));
     }
 
+    this.isIntentionalDisconnect = false;
+
     // Attempt direct WebSocket connection first
     try {
       await this.rawConnect();
@@ -127,10 +138,10 @@ export class SignalingClient {
       console.warn('[CrossDrop Signaling] Initial connection failed. Checking if server is waking up...');
       const isAwake = await this.waitForServerWakeup(60000);
       if (isAwake && !this.abortWaking) {
-        this.notifyStatus('connecting', 'Server ready. Connecting signaling channel...');
+        this.notifyState('CONNECTING', 'Server ready. Connecting signaling channel...');
         await this.rawConnect();
       } else {
-        this.notifyStatus('disconnected', 'Signaling server unreachable');
+        this.notifyState('DISCONNECTED', 'Signaling server unreachable');
         this.callbacks.onError?.('SERVER_CONNECTION_ERROR', 'Could not connect to signaling server.');
         throw new Error('Signaling server is unreachable or failed to wake up in time.');
       }
@@ -139,7 +150,7 @@ export class SignalingClient {
 
   private rawConnect(): Promise<void> {
     this.isConnecting = true;
-    this.notifyStatus('connecting', 'Connecting to signaling server...');
+    this.notifyState('CONNECTING', 'Connecting to signaling server...');
 
     return new Promise((resolve, reject) => {
       let isSettled = false;
@@ -151,10 +162,11 @@ export class SignalingClient {
 
         socket.onopen = () => {
           this.isConnecting = false;
+          this.reconnectAttempts = 0;
           if (!isSettled) {
             isSettled = true;
             console.log('[CrossDrop Signaling] Connected to signaling server.');
-            this.notifyStatus('connected', 'Connected to signaling server');
+            this.notifyState('SIGNALING_CONNECTED', 'Connected to signaling server');
             resolve();
           }
         };
@@ -168,12 +180,18 @@ export class SignalingClient {
             `[CrossDrop Signaling] Disconnected from ${this.url} (code: ${code}, reason: "${reason}", wasClean: ${wasClean})`
           );
 
-          this.notifyStatus('disconnected', 'Disconnected');
           this.ws = null;
 
           if (!isSettled) {
             isSettled = true;
             reject(new Error(`Could not connect to signaling server (code ${code})`));
+          }
+
+          // Trigger automatic reconnection if disconnection was unexpected during an active session
+          if (!this.isIntentionalDisconnect && this.currentRoomCode) {
+            this.scheduleReconnect();
+          } else {
+            this.notifyState('DISCONNECTED', 'Disconnected');
           }
         };
 
@@ -202,15 +220,53 @@ export class SignalingClient {
     });
   }
 
+  private scheduleReconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.warn('[CrossDrop Signaling] Max reconnect attempts reached.');
+      this.currentRoomCode = null;
+      this.notifyState('ERROR', 'Connection lost. Please rejoin or create a new room.');
+      this.callbacks.onError?.(
+        'RECONNECT_FAILED',
+        'Could not restore signaling connection. The room may have expired.'
+      );
+      return;
+    }
+
+    const backoffMs = Math.min(8000, 1000 * Math.pow(2, this.reconnectAttempts));
+    this.reconnectAttempts++;
+    console.log(
+      `[CrossDrop Signaling] Reconnecting in ${backoffMs / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
+    );
+    this.notifyState('RECONNECTING', `Reconnecting to server (attempt ${this.reconnectAttempts})...`);
+
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        await this.rawConnect();
+        if (this.currentRoomCode) {
+          console.log(`[CrossDrop Signaling] Re-joining room ${this.currentRoomCode} after reconnect...`);
+          this.joinRoom(this.currentRoomCode);
+        }
+      } catch {
+        this.scheduleReconnect();
+      }
+    }, backoffMs);
+  }
+
   private handleMessage(msg: SignalingServerMessage) {
     switch (msg.type) {
       case 'room-created':
+        this.currentRoomCode = msg.code;
+        this.notifyState('WAITING_FOR_PEER', 'Room created, waiting for peer');
         this.callbacks.onRoomCreated?.(msg.roomId, msg.code);
         break;
       case 'room-joined':
+        this.currentRoomCode = msg.code;
+        this.notifyState('NEGOTIATING', 'Joined room, negotiating connection');
         this.callbacks.onRoomJoined?.(msg.roomId, msg.code);
         break;
       case 'peer-joined':
+        this.notifyState('NEGOTIATING', 'Peer joined, establishing P2P connection');
         this.callbacks.onPeerJoined?.();
         break;
       case 'signal':
@@ -220,6 +276,9 @@ export class SignalingClient {
         this.callbacks.onPeerDisconnected?.(msg.reason);
         break;
       case 'error':
+        if (msg.code === 'ROOM_NOT_FOUND') {
+          this.currentRoomCode = null;
+        }
         this.callbacks.onError?.(msg.code, msg.message);
         break;
     }
@@ -238,6 +297,7 @@ export class SignalingClient {
   }
 
   public joinRoom(code: string) {
+    this.currentRoomCode = code;
     this.send({ type: 'join-room', code });
   }
 
@@ -246,14 +306,22 @@ export class SignalingClient {
   }
 
   public leaveRoom() {
+    this.currentRoomCode = null;
+    this.isIntentionalDisconnect = true;
+    clearTimeout(this.reconnectTimer);
     this.send({ type: 'leave-room' });
+    this.notifyState('DISCONNECTED', 'Left room');
   }
 
   public disconnect() {
+    this.isIntentionalDisconnect = true;
+    this.currentRoomCode = null;
     this.abortWaking = true;
+    clearTimeout(this.reconnectTimer);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
+    this.notifyState('DISCONNECTED', 'Disconnected');
   }
 }

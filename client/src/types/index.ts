@@ -1,11 +1,15 @@
 export type ConnectionState =
-  | 'Disconnected'
-  | 'Connecting'
-  | 'Waking'
-  | 'Connected'
-  | 'Transferring'
-  | 'Completed'
-  | 'Error';
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'WAKING'
+  | 'SIGNALING_CONNECTED'
+  | 'WAITING_FOR_PEER'
+  | 'NEGOTIATING'
+  | 'CONNECTED'
+  | 'TRANSFERRING'
+  | 'COMPLETED'
+  | 'RECONNECTING'
+  | 'ERROR';
 
 export type TransferStatus =
   | 'idle'
@@ -24,23 +28,47 @@ export interface FileMetadata {
   mimeType: string;
   totalChunks: number;
   chunkSize: number;
+  fileIndex: number;
+  totalFiles: number;
+}
+
+export interface FileTransferItem {
+  id: string;
+  name: string;
+  size: number;
+  status: TransferStatus;
+  transferredBytes: number;
 }
 
 export interface TransferProgress {
   status: TransferStatus;
   fileName: string;
+  fileIndex: number;
+  totalFiles: number;
   transferredBytes: number;
   totalBytes: number;
   percentage: number;
+  overallTransferredBytes: number;
+  overallTotalBytes: number;
+  overallPercentage: number;
+  speedBytesPerSec: number;
+  etaSeconds: number | null;
   error?: string;
 }
 
 export interface ReceivedFile {
+  id: string;
   name: string;
   size: number;
   mimeType: string;
   blob: Blob;
   url: string;
+  receivedAt: number;
+}
+
+export interface PeerDevice {
+  name: string;
+  platform?: string;
 }
 
 export type SignalingServerMessage =

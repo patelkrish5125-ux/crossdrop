@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import type {
   ConnectionState,
+  PeerDevice,
   ReceivedFile,
   TransferProgress,
 } from './types/index.ts';
 import { SignalingClient } from './services/signaling.ts';
 import { WebRTCService } from './services/webrtc.ts';
 import { getSignalingConfig } from './config.ts';
+import { generateQRCodeSVG } from './utils/qr.ts';
 
 type AppStep =
   | 'home'
@@ -26,52 +28,107 @@ function formatBytes(bytes: number, decimals = 1): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
 }
 
+function formatEta(seconds: number | null): string {
+  if (seconds === null || seconds <= 0) return '--';
+  if (seconds < 60) return `${seconds}s remaining`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}m ${s < 10 ? '0' : ''}${s}s remaining`;
+}
+
+function getDefaultDeviceName(): string {
+  if (typeof window === 'undefined') return 'Device';
+  const ua = navigator.userAgent;
+  if (/android/i.test(ua)) return 'Android Device';
+  if (/iPhone|iPad|iPod/i.test(ua)) return 'Apple Device';
+  if (/Macintosh|Mac OS X/i.test(ua)) return 'Mac';
+  if (/Windows NT/i.test(ua)) return 'Windows PC';
+  if (/Linux/i.test(ua)) return 'Linux PC';
+  return 'Browser Device';
+}
+
 export default function App() {
   const [step, setStep] = useState<AppStep>('home');
-  const [connectionState, setConnectionState] = useState<ConnectionState>('Disconnected');
+  const [connectionState, setConnectionState] = useState<ConnectionState>('DISCONNECTED');
   const [roomCode, setRoomCode] = useState<string>('');
   const [inputCode, setInputCode] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [copySuccess, setCopySuccess] = useState<boolean>(false);
 
-  // File state
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [receivedFile, setReceivedFile] = useState<ReceivedFile | null>(null);
+  // Device naming
+  const [deviceName, setDeviceName] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('crossdrop_device_name');
+      if (saved && saved.trim()) return saved.trim();
+    }
+    return getDefaultDeviceName();
+  });
+  const [peerDevice, setPeerDevice] = useState<PeerDevice | null>(null);
+
+  // File state (Multiple files)
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [receivedFiles, setReceivedFiles] = useState<ReceivedFile[]>([]);
   const [progress, setProgress] = useState<TransferProgress | null>(null);
   const [isSender, setIsSender] = useState<boolean>(false);
+  const [isDragging, setIsDragging] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const signalingRef = useRef<SignalingClient | null>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
 
+  // Update local device name in storage and WebRTC
+  const handleDeviceNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const newName = e.target.value;
+    setDeviceName(newName);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('crossdrop_device_name', newName);
+    }
+    webrtcRef.current?.setDeviceName(newName);
+  };
+
+  // Check URL query parameter on load for instant QR join
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const joinParam = params.get('join');
+      if (joinParam && /^\d{6}$/.test(joinParam.trim())) {
+        setInputCode(joinParam.trim());
+        setStep('joining_room');
+      }
+    }
+  }, []);
+
   // Initialize WebRTC and Signaling services
   useEffect(() => {
-    console.log('[CrossDrop] Secure context:', window.isSecureContext);
     const config = getSignalingConfig();
     if (config.isConfigured) {
       console.log(`[CrossDrop] Signaling URL: ${config.url}`);
-    } else {
-      console.error('[CrossDrop] Signaling URL: NOT CONFIGURED (Missing VITE_SIGNALING_URL in production build)');
     }
+
     const signaling = new SignalingClient();
     signalingRef.current = signaling;
 
     const webrtc = new WebRTCService((signal) => {
       signaling.sendSignal(signal);
     });
+    webrtc.setDeviceName(deviceName);
     webrtcRef.current = webrtc;
 
     // WebRTC Callbacks
     webrtc.setCallbacks({
       onConnectionStateChange: (state) => {
         setConnectionState(state);
-        if (state === 'Connected') {
+        if (state === 'CONNECTED') {
           setStep((prev) => (prev === 'transferring' || prev === 'completed' ? prev : 'connected'));
-        } else if (state === 'Disconnected') {
+        } else if (state === 'DISCONNECTED') {
           setErrorMessage('Peer device disconnected.');
           setStep('error');
-        } else if (state === 'Error') {
+        } else if (state === 'ERROR') {
           setStep('error');
         }
+      },
+      onPeerInfo: (peer) => {
+        setPeerDevice(peer);
       },
       onProgress: (p) => {
         setProgress(p);
@@ -85,7 +142,7 @@ export default function App() {
         }
       },
       onFileReceived: (file) => {
-        setReceivedFile(file);
+        setReceivedFiles((prev) => [...prev, file]);
         setIsSender(false);
       },
       onError: (err) => {
@@ -96,17 +153,26 @@ export default function App() {
 
     // Signaling Callbacks
     signaling.setCallbacks({
+      onStateChange: (state) => {
+        setConnectionState((prev) => {
+          // Keep WebRTC state if already connected or transferring
+          if (prev === 'CONNECTED' || prev === 'TRANSFERRING' || prev === 'COMPLETED') {
+            return prev;
+          }
+          return state;
+        });
+      },
       onRoomCreated: (_id, code) => {
         setRoomCode(code);
         setStep('creating_room');
-        setConnectionState('Connecting');
+        setConnectionState('WAITING_FOR_PEER');
       },
       onRoomJoined: (_id, _code) => {
-        setConnectionState('Connecting');
+        setConnectionState('NEGOTIATING');
         webrtc.initConnection(false); // Joiner waits for offer
       },
       onPeerJoined: () => {
-        setConnectionState('Connecting');
+        setConnectionState('NEGOTIATING');
         webrtc.initConnection(true); // Creator initiates offer
       },
       onSignal: (signalData) => {
@@ -114,28 +180,13 @@ export default function App() {
       },
       onPeerDisconnected: (reason) => {
         setErrorMessage(reason || 'Device disconnected.');
-        setConnectionState('Disconnected');
+        setConnectionState('DISCONNECTED');
         setStep('error');
         webrtc.cleanup();
       },
-      onConnectionChange: (connected, statusText) => {
-        if (!connected) {
-          setConnectionState('Disconnected');
-        } else {
-          console.log('[CrossDrop App] Signaling status:', statusText);
-        }
-      },
-      onStatusChange: (status, statusText) => {
-        if (status === 'waking') {
-          setConnectionState('Waking');
-        } else if (status === 'connecting') {
-          setConnectionState('Connecting');
-        }
-        console.log('[CrossDrop App] Status changed:', status, statusText);
-      },
       onError: (_code, message) => {
         setErrorMessage(message);
-        setConnectionState('Disconnected');
+        setConnectionState('ERROR');
         setStep('error');
       },
     });
@@ -149,14 +200,14 @@ export default function App() {
   const handleCreateRoom = async () => {
     try {
       setErrorMessage('');
-      setConnectionState('Connecting');
+      setConnectionState('CONNECTING');
       if (signalingRef.current) {
         await signalingRef.current.connect();
         signalingRef.current.createRoom();
       }
     } catch {
       setErrorMessage('Could not connect to signaling server.');
-      setConnectionState('Disconnected');
+      setConnectionState('ERROR');
       setStep('error');
     }
   };
@@ -172,33 +223,70 @@ export default function App() {
 
     try {
       setErrorMessage('');
-      setConnectionState('Connecting');
+      setConnectionState('CONNECTING');
       if (signalingRef.current) {
         await signalingRef.current.connect();
         signalingRef.current.joinRoom(cleanCode);
       }
     } catch {
       setErrorMessage('Could not connect to signaling server.');
-      setConnectionState('Disconnected');
+      setConnectionState('ERROR');
       setStep('error');
     }
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      setSelectedFile(e.target.files[0]);
+      const filesArray = Array.from(e.target.files);
+      setSelectedFiles(filesArray);
+      setErrorMessage('');
     }
   };
 
-  const handleSendFile = async () => {
-    if (!selectedFile || !webrtcRef.current) return;
+  const handleRemoveFile = (index: number) => {
+    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  // Drag and Drop Event Handlers
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const filesArray = Array.from(e.dataTransfer.files);
+      setSelectedFiles(filesArray);
+      setErrorMessage('');
+    }
+  };
+
+  const handleSendFiles = async () => {
+    if (selectedFiles.length === 0 || !webrtcRef.current) return;
     setIsSender(true);
-    setStep('transferring');
+    setErrorMessage('');
+
     try {
-      await webrtcRef.current.sendFile(selectedFile);
+      await webrtcRef.current.sendFiles(selectedFiles);
     } catch (err: any) {
       setErrorMessage(err.message || 'File transfer failed.');
-      setStep('error');
+      setStep('connected');
     }
   };
 
@@ -208,20 +296,25 @@ export default function App() {
     }
   };
 
-  const handleDownload = () => {
-    if (!receivedFile) return;
+  const handleDownload = (file: ReceivedFile) => {
     const a = document.createElement('a');
-    a.href = receivedFile.url;
-    a.download = receivedFile.name;
+    a.href = file.url;
+    a.download = file.name;
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   };
 
-  const handleResetForNextFile = () => {
-    setSelectedFile(null);
-    setReceivedFile(null);
+  const handleDownloadAll = () => {
+    receivedFiles.forEach((file, index) => {
+      setTimeout(() => handleDownload(file), index * 300);
+    });
+  };
+
+  const handleSendMoreFiles = () => {
+    setSelectedFiles([]);
+    setReceivedFiles([]);
     setProgress(null);
     setErrorMessage('');
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -229,13 +322,14 @@ export default function App() {
   };
 
   const handleFullReset = () => {
-    setSelectedFile(null);
-    setReceivedFile(null);
+    setSelectedFiles([]);
+    setReceivedFiles([]);
     setProgress(null);
     setErrorMessage('');
     setRoomCode('');
     setInputCode('');
-    setConnectionState('Disconnected');
+    setPeerDevice(null);
+    setConnectionState('DISCONNECTED');
     if (fileInputRef.current) fileInputRef.current.value = '';
     if (signalingRef.current) {
       signalingRef.current.leaveRoom();
@@ -246,64 +340,88 @@ export default function App() {
     setStep('home');
   };
 
+  const handleCopyCode = () => {
+    if (roomCode && navigator.clipboard) {
+      navigator.clipboard.writeText(roomCode);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+    }
+  };
+
+  // QR Code URL & SVG Generation
+  const joinUrl =
+    typeof window !== 'undefined' && roomCode
+      ? `${window.location.origin}/?join=${roomCode}`
+      : '';
+  const qrSvg = joinUrl ? generateQRCodeSVG(joinUrl, 180) : '';
+
+  const totalSelectedBytes = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+
   return (
     <main className="app-container">
       {/* App Header */}
       <header className="app-header">
         <h1 className="app-title">
-          CrossDrop <span className="app-badge">Phase 1</span>
+          CrossDrop <span className="app-badge">Phase 2</span>
         </h1>
-        <p className="app-subtitle">Send files directly between your devices</p>
-        <div
-          id="secure-context-badge"
-          style={{
-            marginTop: '0.5rem',
-            fontSize: '0.75rem',
-            fontWeight: 500,
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '0.35rem',
-            padding: '0.2rem 0.6rem',
-            borderRadius: '12px',
-            backgroundColor: window.isSecureContext ? 'rgba(16, 185, 129, 0.15)' : 'rgba(245, 158, 11, 0.15)',
-            color: window.isSecureContext ? '#10b981' : '#f59e0b',
-            border: `1px solid ${window.isSecureContext ? 'rgba(16, 185, 129, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`,
-          }}
-        >
-          <span>{window.isSecureContext ? '🔒' : '⚠️'}</span>
-          <span>Secure context: {window.isSecureContext ? 'true' : 'false'}</span>
+        <p className="app-subtitle">Direct, peer-to-peer file transfer between your devices</p>
+
+        {/* Device Name Banner */}
+        <div className="device-bar" style={{ marginTop: '0.75rem' }}>
+          <div className="device-label">
+            <span>💻</span>
+            <span>Your Device:</span>
+            <input
+              type="text"
+              className="device-input-inline"
+              value={deviceName}
+              onChange={handleDeviceNameChange}
+              title="Click to change device name"
+              maxLength={24}
+            />
+          </div>
+          {peerDevice && (
+            <div className="peer-badge" title="Connected Peer">
+              <span>📱</span>
+              <span>{peerDevice.name}</span>
+            </div>
+          )}
         </div>
       </header>
 
-      {/* Active Connection State Banner */}
-      {step !== 'home' && step !== 'joining_room' && (
+      {/* Real Connection State Banner */}
+      {connectionState !== 'DISCONNECTED' && (
         <div
           className={`status-banner ${
-            connectionState === 'Connected'
+            connectionState === 'CONNECTED' || connectionState === 'COMPLETED'
               ? 'connected'
-              : connectionState === 'Connecting' || connectionState === 'Waking'
-              ? 'connecting'
-              : 'error'
+              : connectionState === 'ERROR'
+              ? 'error'
+              : 'connecting'
           }`}
         >
           <span className="status-dot" />
           <span>
-            {connectionState === 'Connected'
-              ? '✓ Connected'
-              : connectionState === 'Waking'
+            {connectionState === 'CONNECTED'
+              ? peerDevice
+                ? `✓ Connected to ${peerDevice.name}`
+                : '✓ Connected to Peer'
+              : connectionState === 'WAKING'
               ? '⏳ Waking server (Render free tier cold start ~30s)...'
-              : connectionState === 'Connecting'
-              ? 'Connecting...'
+              : connectionState === 'WAITING_FOR_PEER'
+              ? 'Waiting for another device to connect...'
+              : connectionState === 'NEGOTIATING'
+              ? 'Establishing direct P2P link...'
+              : connectionState === 'RECONNECTING'
+              ? '🔄 Reconnecting to signaling server...'
+              : connectionState === 'TRANSFERRING'
+              ? 'Transferring files...'
+              : connectionState === 'COMPLETED'
+              ? '✓ Transfer complete'
+              : connectionState === 'CONNECTING'
+              ? 'Connecting to server...'
               : connectionState}
           </span>
-        </div>
-      )}
-
-      {/* Global Waking Indicator when on Home or Joining Screen */}
-      {connectionState === 'Waking' && (step === 'home' || step === 'joining_room') && (
-        <div className="status-banner connecting" style={{ marginBottom: '1rem' }}>
-          <span className="status-dot" />
-          <span>⏳ Waking server (Render free tier cold start ~30s)... please wait</span>
         </div>
       )}
 
@@ -328,139 +446,202 @@ export default function App() {
         </section>
       )}
 
-      {/* Screen 2: Room Created (Waiting for Peer) */}
+      {/* Screen 2: Room Created (QR Code & 6-Digit Code) */}
       {step === 'creating_room' && (
         <section className="card-section">
           <div className="code-box">
-            <span className="code-title">Your pairing code</span>
+            <span className="code-title">Scan QR code or enter 6-digit code</span>
+
+            {/* QR Code pairing */}
+            {qrSvg && (
+              <div className="qr-box">
+                <div
+                  className="qr-image-wrapper"
+                  dangerouslySetInnerHTML={{ __html: qrSvg }}
+                />
+                <span className="qr-hint">Scan with your phone's camera to join instantly</span>
+              </div>
+            )}
+
             <span className="code-digits">{roomCode}</span>
-            <span className="code-hint">Waiting for another device to connect...</span>
+
+            <button
+              className="btn btn-secondary"
+              onClick={handleCopyCode}
+              style={{ width: 'auto', minHeight: '38px', padding: '0.45rem 1rem', fontSize: '0.85rem' }}
+            >
+              {copySuccess ? '✓ Code Copied!' : '📋 Copy Pairing Code'}
+            </button>
+
+            <span className="code-hint">Keep this window open until connected</span>
           </div>
+
           <button className="btn btn-secondary" onClick={handleFullReset}>
             Cancel
           </button>
         </section>
       )}
 
-      {/* Screen 3: Join Room (Numeric Keypad on Mobile) */}
+      {/* Screen 3: Join Room */}
       {step === 'joining_room' && (
-        <form className="card-section" onSubmit={handleJoinRoom}>
-          <div className="input-group">
+        <section className="card-section">
+          <form className="input-group" onSubmit={handleJoinRoom}>
             <label htmlFor="pairing-code" className="input-label">
-              Enter 6-digit pairing code
+              Enter the 6-digit pairing code
             </label>
             <input
               id="pairing-code"
               type="text"
               inputMode="numeric"
               pattern="[0-9]*"
-              autoComplete="one-time-code"
               maxLength={6}
-              placeholder="000000"
-              autoFocus
               className="code-input"
+              placeholder="123456"
+              autoFocus
               value={inputCode}
               onChange={(e) => setInputCode(e.target.value.replace(/\D/g, ''))}
             />
-          </div>
-          <div className="btn-group">
-            <button
-              id="connect-btn"
-              type="submit"
-              className="btn btn-primary"
-              disabled={inputCode.trim().length !== 6}
-            >
-              Connect
-            </button>
-            <button type="button" className="btn btn-secondary" onClick={handleFullReset}>
-              Back
-            </button>
-          </div>
-        </form>
-      )}
-
-      {/* Screen 4: Connected (Mobile-Optimized File Picker & Send) */}
-      {step === 'connected' && (
-        <section className="card-section">
-          <p className="section-label">Send a file</p>
-
-          {/* Offscreen native file input */}
-          <input
-            id="file-input"
-            ref={fileInputRef}
-            type="file"
-            className="sr-only-input"
-            onChange={handleFileSelect}
-          />
-
-          {!selectedFile ? (
-            <div className="btn-group">
-              {/* Native label trigger ensures reliable tap on Android Chrome */}
-              <label htmlFor="file-input" id="choose-file-btn" className="btn btn-primary">
-                Choose File
-              </label>
-              <button className="btn btn-secondary" onClick={handleFullReset}>
-                Disconnect
+            <div className="btn-group" style={{ marginTop: '0.5rem' }}>
+              <button
+                type="submit"
+                id="submit-join-btn"
+                className="btn btn-primary"
+                disabled={inputCode.trim().length !== 6}
+              >
+                Connect to Device
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => {
+                  setErrorMessage('');
+                  setStep('home');
+                }}
+              >
+                Back
               </button>
             </div>
-          ) : (
-            <>
-              {/* File Info Card with clean truncation */}
-              <div className="file-card">
-                <div className="file-info">
-                  <span className="file-name" title={selectedFile.name}>
-                    {selectedFile.name}
-                  </span>
-                  <span className="file-size">{formatBytes(selectedFile.size)}</span>
-                </div>
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-change-file"
-                  onClick={() => {
-                    setSelectedFile(null);
-                    if (fileInputRef.current) fileInputRef.current.value = '';
-                  }}
-                >
-                  Change
-                </button>
-              </div>
-
-              <div className="btn-group">
-                <button id="send-file-btn" className="btn btn-primary" onClick={handleSendFile}>
-                  Send File
-                </button>
-                <button className="btn btn-secondary" onClick={handleFullReset}>
-                  Disconnect
-                </button>
-              </div>
-            </>
-          )}
+          </form>
         </section>
       )}
 
-      {/* Screen 5: Transferring (Real-time Progress) */}
+      {/* Screen 4: Connected — Multi-File Selection & Drag/Drop */}
+      {step === 'connected' && (
+        <section className="card-section">
+          <input
+            type="file"
+            multiple
+            ref={fileInputRef}
+            onChange={handleFileSelect}
+            className="sr-only-input"
+            id="file-selector-input"
+          />
+
+          {/* Interactive Drag & Drop Area */}
+          <div
+            className={`drop-zone ${isDragging ? 'active' : ''}`}
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <span className="drop-zone-icon">📁</span>
+            <div className="drop-zone-title">
+              {isDragging ? 'Drop files here!' : 'Choose or drop files to send'}
+            </div>
+            <div className="drop-zone-subtitle">
+              Click to browse or drag & drop one or multiple files
+            </div>
+          </div>
+
+          {/* Selected File(s) Queue */}
+          {selectedFiles.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+              <div className="queue-summary">
+                <span>Selected Files ({selectedFiles.length}):</span>
+                <span>Total: {formatBytes(totalSelectedBytes)}</span>
+              </div>
+              <div className="file-queue">
+                {selectedFiles.map((file, idx) => (
+                  <div key={idx} className="file-queue-item">
+                    <span className="file-queue-name" title={file.name}>
+                      {file.name}
+                    </span>
+                    <span className="file-queue-size">{formatBytes(file.size)}</span>
+                    <button
+                      type="button"
+                      className="btn-remove-file"
+                      onClick={() => handleRemoveFile(idx)}
+                      title="Remove file"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                id="send-file-btn"
+                className="btn btn-primary"
+                onClick={handleSendFiles}
+                style={{ marginTop: '0.5rem' }}
+              >
+                Send {selectedFiles.length === 1 ? '1 File' : `${selectedFiles.length} Files`}
+              </button>
+            </div>
+          )}
+
+          <button className="btn btn-danger" onClick={handleFullReset} style={{ marginTop: '0.25rem' }}>
+            Disconnect
+          </button>
+        </section>
+      )}
+
+      {/* Screen 5: Transferring Active Progress */}
       {step === 'transferring' && progress && (
         <section className="card-section">
           <div className="progress-card">
             <div className="progress-header">
-              <span className="progress-title" title={progress.fileName}>
-                {progress.status === 'sending' ? `Sending ${progress.fileName}` : `Receiving ${progress.fileName}`}
+              <span className="progress-title">
+                {progress.status === 'sending' ? 'Sending' : 'Receiving'}{' '}
+                {progress.totalFiles > 1 ? `(${progress.fileIndex + 1}/${progress.totalFiles}): ` : ': '}
+                {progress.fileName}
               </span>
-              <span className="progress-percent">{progress.percentage}%</span>
+              <span className="progress-percent">
+                {progress.totalFiles > 1 ? `${progress.overallPercentage}%` : `${progress.percentage}%`}
+              </span>
             </div>
 
             <div className="progress-bar-bg">
               <div
                 className="progress-bar-fill"
-                style={{ width: `${Math.max(0, Math.min(100, progress.percentage))}%` }}
+                style={{
+                  width: `${progress.totalFiles > 1 ? progress.overallPercentage : progress.percentage}%`,
+                }}
               />
             </div>
 
             <div className="progress-footer">
               <span>
-                {formatBytes(progress.transferredBytes)} / {formatBytes(progress.totalBytes)}
+                {formatBytes(progress.totalFiles > 1 ? progress.overallTransferredBytes : progress.transferredBytes)} /{' '}
+                {formatBytes(progress.totalFiles > 1 ? progress.overallTotalBytes : progress.totalBytes)}
               </span>
-              <span>{progress.status.charAt(0).toUpperCase() + progress.status.slice(1)}</span>
+              <span>{progress.percentage}% file</span>
+            </div>
+
+            {/* Live Metrics Row: Speed & ETA */}
+            <div className="metrics-row">
+              <span className="metric-badge">
+                <span>⚡</span>
+                <span className="metric-value">
+                  {progress.speedBytesPerSec > 0 ? `${formatBytes(progress.speedBytesPerSec)}/s` : 'Calculating...'}
+                </span>
+              </span>
+              <span className="metric-badge">
+                <span>⏱️</span>
+                <span className="metric-value">{formatEta(progress.etaSeconds)}</span>
+              </span>
             </div>
           </div>
 
@@ -470,73 +651,83 @@ export default function App() {
         </section>
       )}
 
-      {/* Screen 6: Completed (Download & Reset) */}
+      {/* Screen 6: Transfer Completed / Received Files */}
       {step === 'completed' && (
         <section className="card-section">
-          {isSender ? (
-            <div className="success-box">
-              <div className="success-icon">✓</div>
-              <h3 className="success-title">File sent successfully!</h3>
-              {selectedFile && (
-                <p className="file-size">
-                  {selectedFile.name} ({formatBytes(selectedFile.size)})
-                </p>
-              )}
-              <div className="btn-group">
-                <button className="btn btn-primary" onClick={handleResetForNextFile}>
-                  Send Another File
-                </button>
-                <button className="btn btn-secondary" onClick={handleFullReset}>
-                  Disconnect
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="success-box">
-              <div className="success-icon">✓</div>
-              <h3 className="success-title">Transfer complete</h3>
-              {receivedFile && (
-                <div className="file-info" style={{ textAlign: 'center', width: '100%' }}>
-                  <span className="file-name" style={{ textAlign: 'center' }}>
-                    {receivedFile.name}
+          <div className="success-box">
+            <span className="success-icon">✓</span>
+            <div className="success-title">Transfer Complete!</div>
+
+            {/* Sender summary */}
+            {isSender && (
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.95rem' }}>
+                All {selectedFiles.length} file(s) ({formatBytes(totalSelectedBytes)}) were delivered directly to{' '}
+                {peerDevice?.name || 'peer'}.
+              </p>
+            )}
+
+            {/* Receiver multi-file download list */}
+            {!isSender && receivedFiles.length > 0 && (
+              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                    Received Files ({receivedFiles.length}):
                   </span>
-                  <span className="file-size">{formatBytes(receivedFile.size)}</span>
+                  {receivedFiles.length > 1 && (
+                    <button
+                      className="btn btn-success"
+                      style={{ width: 'auto', minHeight: '36px', padding: '0.35rem 0.8rem', fontSize: '0.8rem' }}
+                      onClick={handleDownloadAll}
+                    >
+                      Download All
+                    </button>
+                  )}
                 </div>
-              )}
-              <div className="btn-group">
-                <button id="download-btn" className="btn btn-success" onClick={handleDownload}>
-                  Download File
-                </button>
-                <button className="btn btn-secondary" onClick={handleResetForNextFile}>
-                  Ready for Next File
-                </button>
+
+                <div className="received-list">
+                  {receivedFiles.map((file, idx) => (
+                    <div key={file.id || idx} className="received-item">
+                      <div className="received-item-info">
+                        <span className="received-item-name">{file.name}</span>
+                        <span className="received-item-size">{formatBytes(file.size)}</span>
+                      </div>
+                      <button
+                        className="btn-download-sm"
+                        onClick={() => handleDownload(file)}
+                      >
+                        Download
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
+
+          <div className="btn-group">
+            <button className="btn btn-primary" onClick={handleSendMoreFiles}>
+              Send More Files
+            </button>
+            <button className="btn btn-secondary" onClick={handleFullReset}>
+              Leave Room
+            </button>
+          </div>
         </section>
       )}
 
-      {/* Screen 7: Error State */}
+      {/* Error Message Display */}
+      {errorMessage && (
+        <div className="status-banner error" style={{ wordBreak: 'break-word' }}>
+          <span>{errorMessage}</span>
+        </div>
+      )}
+
+      {/* Error Screen Actions */}
       {step === 'error' && (
         <section className="card-section">
-          <div className="status-banner error">
-            <span className="status-dot" />
-            <span>{errorMessage || 'An error occurred.'}</span>
-          </div>
-          <div className="btn-group">
-            <button className="btn btn-primary" onClick={handleFullReset}>
-              Create New Room
-            </button>
-            <button
-              className="btn btn-secondary"
-              onClick={() => {
-                handleFullReset();
-                setStep('joining_room');
-              }}
-            >
-              Join Room
-            </button>
-          </div>
+          <button className="btn btn-secondary" onClick={handleFullReset}>
+            Start Over
+          </button>
         </section>
       )}
     </main>

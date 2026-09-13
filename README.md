@@ -1,8 +1,47 @@
-# CrossDrop — Phase 1: Peer-to-Peer File Transfer
+# CrossDrop — Cross-Device Peer-to-Peer File Transfer
 
-CrossDrop is a cross-device file sharing web application that transfers files directly between devices (Laptop ↔ Phone, Phone ↔ Laptop, Phone ↔ Phone) using **WebRTC RTCDataChannel** with a lightweight Node.js + WebSocket signaling server.
+CrossDrop is a lightweight cross-device file sharing web application that transfers files directly between devices (Laptop ↔ Phone, Phone ↔ Laptop, Phone ↔ Phone, Laptop ↔ Laptop) using **WebRTC RTCDataChannel** with a lightweight Node.js + WebSocket signaling server.
 
-> **Phase 1 Scope**: Pure peer-to-peer file transfer over WebRTC. Files are **never** uploaded to or routed through the server. The signaling server exchanges only the temporary room metadata, SDP offers/answers, and ICE candidates necessary to connect the two browsers.
+> **Privacy & Architecture**: Pure peer-to-peer file transfer over WebRTC. Files are **never** uploaded to or routed through any server. The signaling server exchanges only temporary room metadata, SDP offers/answers, and ICE candidates necessary to establish the direct browser-to-browser connection.
+
+---
+
+## Phase 2 Features
+
+1. **QR Code Pairing**:
+   - Creator generates room and gets an instant QR code alongside the 6-digit code.
+   - Joiner scans with phone camera or clicks the link containing `?join=XXXXXX` to automatically connect.
+   - Clean, zero-dependency pure TypeScript SVG vector QR generation.
+
+2. **Multi-File Queue & Progress**:
+   - Send multiple files in a single session.
+   - Per-file progress bars, file sizes, and cumulative overall transfer metrics.
+   - Download list with per-file status, individual save buttons, and instant blob access.
+
+3. **Desktop Drag-and-Drop + Mobile Native Picker**:
+   - Seamless dropzone on desktop supporting multi-file drops.
+   - Native OS file picker preserved for mobile browsers.
+
+4. **Real-Time Speed & ETA Estimation**:
+   - Dynamic sliding-window transfer speed calculation (`MB/s` or `KB/s`).
+   - Real-time ETA estimation based on remaining bytes.
+
+5. **Cancel Transfer**:
+   - Instant cancellation on either sender or receiver side.
+   - Aborts ongoing file stream, cleans up partial chunks, notifies peer via control message, and keeps the `RTCDataChannel` open for subsequent transfers.
+
+6. **Device Naming**:
+   - Local device naming stored in `localStorage` (defaults to OS/device type).
+   - Automatically exchanged between peers upon WebRTC connection establishment.
+
+7. **Signaling Resiliency & Exponential Backoff**:
+   - Automatic reconnect with exponential backoff on network dropouts.
+   - Comprehensive connection state model: `DISCONNECTED`, `CONNECTING`, `WAKING`, `SIGNALING_CONNECTED`, `WAITING_FOR_PEER`, `NEGOTIATING`, `CONNECTED`, `TRANSFERRING`, `COMPLETED`, `RECONNECTING`, `ERROR`.
+
+8. **Render Free Tier Cold-Start & Keep-Alive Support**:
+   - Dedicated lightweight `GET /health` endpoint for instant health checking and external pinging.
+   - Automatic client-side wake detection ("Waking server..." spinner) when Render is spinning up from idle.
+   - Optional server self-ping mechanism (`KEEP_ALIVE_URL`) and external uptime monitor integration instructions.
 
 ---
 
@@ -28,22 +67,24 @@ CrossDrop is a cross-device file sharing web application that transfers files di
 ```
 
 - **DataChannel Chunking**: Files are chunked into 16 KB frames with backpressure flow control (`bufferedAmount` & `bufferedAmountLowThreshold`).
-- **File Assembly**: Chunks are reassembled into a native `Blob` on the receiving device and made available for instant download.
+- **File Assembly**: Chunks are reassembled into native `Blob`s on the receiving device and presented in a download queue.
 
 ---
 
 ## Project Structure
 
 ```text
-file transfer/
+crossdrop/
 ├── client/                     # Frontend React + TypeScript + Vite app
 │   ├── src/
 │   │   ├── services/
-│   │   │   ├── signaling.ts   # WebSocket signaling client
-│   │   │   └── webrtc.ts      # WebRTC PeerConnection & RTCDataChannel engine
+│   │   │   ├── signaling.ts   # WebSocket signaling client + reconnect backoff + wake detection
+│   │   │   └── webrtc.ts      # WebRTC PeerConnection, multi-file queue, speed/ETA & cancellation
+│   │   ├── utils/
+│   │   │   └── qr.ts          # Pure vector SVG QR code generator
 │   │   ├── types/
-│   │   │   └── index.ts       # Shared TypeScript types
-│   │   ├── App.tsx            # Main application UI & state transitions
+│   │   │   └── index.ts       # Shared Phase 2 TypeScript types
+│   │   ├── App.tsx            # Main application UI, QR modal, dropzone & transfer queue
 │   │   ├── index.css          # Responsive styling (mobile & desktop)
 │   │   └── main.tsx           # React entry point
 │   ├── index.html
@@ -53,7 +94,7 @@ file transfer/
 │
 ├── server/                     # Minimal signaling server
 │   ├── src/
-│   │   ├── index.ts           # WebSocket & HTTP health server
+│   │   ├── index.ts           # WebSocket server, HTTP /health endpoint & keep-alive
 │   │   ├── roomManager.ts     # In-memory room store (max 2 peers, 6-digit codes)
 │   │   └── types.ts           # Protocol message interfaces
 │   ├── test/
@@ -61,7 +102,9 @@ file transfer/
 │   ├── package.json
 │   └── tsconfig.json
 │
-├── package.json                # Monorepo dev scripts (concurrently)
+├── Dockerfile                  # Production container build (node:20-slim, multi-stage)
+├── render.yaml                 # Render Blueprint configuration
+├── package.json                # Monorepo dev & build scripts
 └── README.md
 ```
 
@@ -70,37 +113,20 @@ file transfer/
 ## Getting Started
 
 ### Prerequisites
-- Node.js 18+ (tested with Node v24.15.0)
+- Node.js 18+ (tested with Node v20/v24)
 - npm 9+
 
 ### 1. Install Dependencies
 
-You can install all dependencies across the project:
-
 ```bash
-# In the project root:
-npm install
-cd server && npm install
-cd ../client && npm install
+npm run install:all
 ```
 
 ### 2. Start Development Servers
 
-Run both the signaling server and frontend simultaneously from the root directory:
+Run both the signaling server and frontend simultaneously:
 
 ```bash
-npm run dev
-```
-
-Or run them individually in separate terminals:
-
-```bash
-# Terminal 1: Signaling Server (starts on http://0.0.0.0:4000)
-cd server
-npm run dev
-
-# Terminal 2: Frontend Client (starts on http://0.0.0.0:3000)
-cd client
 npm run dev
 ```
 
@@ -109,41 +135,34 @@ npm run dev
 
 ---
 
-## How to Test Laptop ↔ Phone Transfer
+## Render Deployment & Keep-Alive Setup
 
-### Step 1: Allow Windows Firewall (Crucial!)
-If your phone gets "Connection timed out" or "Can't reach this site", Windows Firewall is blocking inbound connections to Node.js.
-Right-click `scripts/allow-firewall.bat` and select **Run as administrator** (or run PowerShell as Administrator):
-```powershell
-netsh advfirewall firewall add rule name="CrossDrop Local Dev (3000, 4000)" dir=in action=allow protocol=TCP localport=3000,4000
-```
+Render Free instances automatically spin down after 15 minutes of inactivity (no external incoming HTTP requests).
 
-### Step 2: (Optional) Install Trusted mkcert Certificate on Android Phone
-To eliminate all browser security warnings in Chrome on Android:
-1. On your laptop, install mkcert:
-   ```powershell
-   winget install FiloSottile.mkcert
-   mkcert -install
+### Recommended Keep-Alive Configuration (UptimeRobot / Cron-Job)
+
+To keep your free instance warm during active periods:
+1. Go to [UptimeRobot](https://uptimerobot.com) (free tier allows up to 50 monitors at 5-minute intervals).
+2. Create a new **HTTP(s)** monitor:
+   - **Friendly Name**: `CrossDrop Server`
+   - **URL**: `https://your-app-name.onrender.com/health`
+   - **Monitoring Interval**: `5 minutes`
+3. CrossDrop's `/health` endpoint responds with:
+   ```json
+   {
+     "status": "ok",
+     "timestamp": "2026-09-13T13:00:00.000Z",
+     "uptime": 123.45
+   }
    ```
-2. Double-click `scripts/export-mkcert-ca.bat` to export `rootCA.crt`.
-3. Transfer `rootCA.crt` to your phone (via USB, email, or Google Drive).
-4. On Android, go to **Settings** > **Security** (or **Security & privacy**) > **More security settings** > **Encryption & credentials** > **Install a certificate** > **CA certificate** and select `rootCA.crt`.
+4. This consumes virtually zero CPU or memory and prevents the 15-minute idle spin-down.
 
-### Step 3: Run Dev Server and Connect
-1. Ensure both your Laptop and Phone are connected to the **same Wi-Fi network**.
-2. Run `npm run dev`. The startup banner automatically prints your active phone URL:
-   ```text
-   ==================================================
-     🔒 CrossDrop LAN Dev Server Ready (HTTPS)
-     📱 Phone URL : https://10.166.29.128:3000
-     💻 Local URL : https://localhost:3000
-   ==================================================
-   ```
-3. Open `https://localhost:3000` on your laptop and click **Create Room**.
-4. Open the displayed Phone URL (`https://10.166.29.128:3000`) on your phone.
-5. Confirm the badge shows **🔒 Secure context: true**.
-6. Tap **Join Room**, enter the 6-digit code, and tap **Connect**.
-7. Both devices will display **Connected ✓** and files transfer directly peer-to-peer!
+### Client-Side Cold-Start UX
+
+If the server has spun down into idle mode:
+- The CrossDrop client detects cold starts via `/health` probing.
+- The UI transitions into a friendly **"Waking server..."** state with a pulsing spinner instead of failing immediately.
+- Once the server responds, signaling connects automatically without requiring page reloads.
 
 ---
 
@@ -168,8 +187,8 @@ Test cases covered:
 
 ---
 
-## Known Limitations (Phase 1)
+## Known Platform & WebRTC Limitations
 
-1. **Symmetric NATs / Strict Corporate Firewalls**: Phase 1 uses standard public STUN servers (`stun:stun.l.google.com:19302`). Environments requiring TURN relay servers are out of scope for Phase 1.
-2. **Single Transfer at a Time**: One active file transfer per room session at any moment.
+1. **Symmetric NATs / Strict Enterprise Firewalls**: CrossDrop uses standard public STUN servers (`stun:stun.l.google.com:19302`). Networks that block direct P2P UDP or implement symmetric NAT without hairpinned endpoints require a TURN relay server.
+2. **Render Free Tier Monthly Quota**: Render Free tier provides 750 free instance hours per month. If you run multiple services on the same free account, your instance hours may be exhausted before the end of the calendar month.
 3. **Session Lifetime**: Rooms are strictly ephemeral and are automatically cleared when peers disconnect or after 30 minutes of inactivity.
