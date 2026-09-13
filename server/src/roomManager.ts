@@ -1,11 +1,15 @@
 import type { WebSocket } from 'ws';
 import crypto from 'node:crypto';
-import type { Room, RoomPeer, ServerMessage } from './types.js';
+import type { Room, RoomPeer, ServerMessage, PeerSummary } from './types.js';
+
+export const MAX_ROOM_PEERS = 8;
 
 export class RoomManager {
   private roomsById = new Map<string, Room>();
   private roomIdByCode = new Map<string, string>();
   private peerMap = new Map<WebSocket, { peerId: string; roomId: string }>();
+
+  constructor(public readonly maxPeers = MAX_ROOM_PEERS) {}
 
   /**
    * Generate a unique 6-digit room code
@@ -19,15 +23,13 @@ export class RoomManager {
       }
       attempts++;
     }
-    // Fallback using crypto random
     return crypto.randomInt(100000, 999999).toString();
   }
 
   /**
    * Create a new room with the requesting client as creator
    */
-  public createRoom(ws: WebSocket): { room: Room; peer: RoomPeer } {
-    // If the socket was in another room, remove it first
+  public createRoom(ws: WebSocket, deviceName?: string): { room: Room; peer: RoomPeer } {
     this.removeSocket(ws);
 
     const roomId = crypto.randomUUID();
@@ -38,6 +40,7 @@ export class RoomManager {
       id: peerId,
       ws,
       role: 'creator',
+      name: deviceName?.trim() || 'Creator Device',
     };
 
     const room: Room = {
@@ -60,8 +63,11 @@ export class RoomManager {
    */
   public joinRoom(
     code: string,
-    ws: WebSocket
-  ): { success: true; room: Room; peer: RoomPeer } | { success: false; error: 'ROOM_NOT_FOUND' | 'ROOM_FULL' | 'INVALID_CODE'; message: string } {
+    ws: WebSocket,
+    deviceName?: string
+  ):
+    | { success: true; room: Room; peer: RoomPeer; existingPeers: PeerSummary[] }
+    | { success: false; error: 'ROOM_NOT_FOUND' | 'ROOM_FULL' | 'INVALID_CODE'; message: string } {
     const trimmedCode = code.trim();
     if (!/^\d{6}$/.test(trimmedCode)) {
       return {
@@ -90,16 +96,15 @@ export class RoomManager {
       };
     }
 
-    // Phase 1 enforces exactly 2 devices per room
-    if (room.peers.length >= 2) {
+    // Phase 3 supports multiple devices in a room (up to maxPeers)
+    if (room.peers.length >= this.maxPeers) {
       return {
         success: false,
         error: 'ROOM_FULL',
-        message: 'This room already has 2 devices connected.',
+        message: `This room already reached the maximum limit of ${this.maxPeers} devices.`,
       };
     }
 
-    // Remove socket from previous room if any
     this.removeSocket(ws);
 
     const peerId = crypto.randomUUID();
@@ -107,18 +112,34 @@ export class RoomManager {
       id: peerId,
       ws,
       role: 'joiner',
+      name: deviceName?.trim() || `Device ${room.peers.length + 1}`,
     };
+
+    const existingPeers: PeerSummary[] = room.peers.map((p) => ({
+      id: p.id,
+      name: p.name,
+      role: p.role,
+    }));
 
     room.peers.push(peer);
     room.lastActiveAt = Date.now();
 
     this.peerMap.set(ws, { peerId, roomId });
 
-    return { success: true, room, peer };
+    return { success: true, room, peer, existingPeers };
   }
 
   /**
-   * Get the other peer in the room
+   * Get a specific peer in the room by peerId
+   */
+  public getPeerInRoom(roomId: string, peerId: string): RoomPeer | null {
+    const room = this.roomsById.get(roomId);
+    if (!room) return null;
+    return room.peers.find((p) => p.id === peerId) || null;
+  }
+
+  /**
+   * Get the other peer in the room (for 2-peer backward compatibility)
    */
   public getOtherPeer(ws: WebSocket): RoomPeer | null {
     const info = this.peerMap.get(ws);
@@ -129,6 +150,31 @@ export class RoomManager {
 
     room.lastActiveAt = Date.now();
     return room.peers.find((p) => p.id !== info.peerId) || null;
+  }
+
+  /**
+   * Get all other peers in the room
+   */
+  public getOtherPeers(ws: WebSocket): RoomPeer[] {
+    const info = this.peerMap.get(ws);
+    if (!info) return [];
+
+    const room = this.roomsById.get(info.roomId);
+    if (!room) return [];
+
+    room.lastActiveAt = Date.now();
+    return room.peers.filter((p) => p.id !== info.peerId);
+  }
+
+  /**
+   * Get peer info for a socket
+   */
+  public getPeerForSocket(ws: WebSocket): { peerId: string; roomId: string; name: string } | null {
+    const info = this.peerMap.get(ws);
+    if (!info) return null;
+    const room = this.roomsById.get(info.roomId);
+    const peer = room?.peers.find((p) => p.id === info.peerId);
+    return { peerId: info.peerId, roomId: info.roomId, name: peer?.name || 'Device' };
   }
 
   /**
@@ -143,28 +189,32 @@ export class RoomManager {
   /**
    * Remove a socket when disconnected or leaving
    */
-  public removeSocket(ws: WebSocket): { roomId?: string; notifiedPeer?: RoomPeer } {
+  public removeSocket(ws: WebSocket): {
+    roomId?: string;
+    leftPeerId?: string;
+    remainingPeers: RoomPeer[];
+    notifiedPeer?: RoomPeer;
+  } {
     const info = this.peerMap.get(ws);
-    if (!info) return {};
+    if (!info) return { remainingPeers: [] };
 
     this.peerMap.delete(ws);
     const room = this.roomsById.get(info.roomId);
-    if (!room) return {};
+    if (!room) return { remainingPeers: [] };
 
-    // Find remaining peer if any
-    const remainingPeers = room.peers.filter((p) => p.id !== info.peerId);
+    const leftPeerId = info.peerId;
+    const remainingPeers = room.peers.filter((p) => p.id !== leftPeerId);
     const notifiedPeer = remainingPeers[0] || undefined;
 
     room.peers = remainingPeers;
     room.lastActiveAt = Date.now();
 
-    // If no peers left, delete room
     if (room.peers.length === 0) {
       this.roomsById.delete(room.id);
       this.roomIdByCode.delete(room.code);
     }
 
-    return { roomId: room.id, notifiedPeer };
+    return { roomId: room.id, leftPeerId, remainingPeers, notifiedPeer };
   }
 
   /**
@@ -176,7 +226,6 @@ export class RoomManager {
 
     for (const [roomId, room] of this.roomsById.entries()) {
       if (now - room.lastActiveAt > maxAgeMs) {
-        // Disconnect any remaining sockets
         for (const peer of room.peers) {
           try {
             const msg: ServerMessage = {

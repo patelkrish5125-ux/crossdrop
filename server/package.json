@@ -8,7 +8,8 @@
     "dev": "tsx watch src/index.ts --dev",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx test/roomManager.test.ts && tsx test/integration.test.ts && tsx test/qr-pairing.test.ts"
+    "test": "tsx test/roomManager.test.ts && tsx test/integration.test.ts && tsx test/qr-pairing.test.ts && tsx test/multi-peer.test.ts",
+    "benchmark": "tsx test/benchmark.ts"
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",

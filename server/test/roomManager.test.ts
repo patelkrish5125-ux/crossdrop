@@ -13,7 +13,7 @@ class MockWebSocket {
 async function runTests() {
   console.log('Running RoomManager unit tests...');
 
-  const rm = new RoomManager();
+  const rm = new RoomManager(2);
 
   // Test 1: Create Room
   const ws1 = new MockWebSocket() as any;

@@ -8,7 +8,7 @@ const TEST_PORT = 4055;
 
 function createTestServer(): Promise<{ server: http.Server; wss: WebSocketServer; close: () => Promise<void> }> {
   return new Promise((resolve) => {
-    const roomManager = new RoomManager();
+    const roomManager = new RoomManager(2);
     const server = http.createServer();
     const wss = new WebSocketServer({ server });
 

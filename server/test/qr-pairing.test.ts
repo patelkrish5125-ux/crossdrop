@@ -9,7 +9,7 @@ const TEST_PORT = 4056;
 
 function createTestServer(): Promise<{ server: http.Server; wss: WebSocketServer; close: () => Promise<void> }> {
   return new Promise((resolve) => {
-    const roomManager = new RoomManager();
+    const roomManager = new RoomManager(2);
     const server = http.createServer((req, res) => {
       // Test SPA fallback for /join route
       if (req.url?.startsWith('/join')) {
