@@ -1,0 +1,23 @@
+{
+  "name": "crossdrop-monorepo",
+  "version": "1.0.0",
+  "description": "CrossDrop - Phase 1 Cross-Device File Sharing Web App",
+  "private": true,
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "dev": "node ./node_modules/concurrently/dist/bin/concurrently.js -n \"server,client\" -c \"blue,green\" \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "build:server": "npm --prefix server run build",
+    "build:client": "npm --prefix client run build",
+    "build": "npm --prefix client run build && npm --prefix server run build && node -e \"const fs=require('fs'); fs.cpSync('client/dist', 'dist', {recursive: true});\"",
+    "start": "node server/dist/index.js",
+    "test:server": "npm --prefix server test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
