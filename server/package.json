@@ -8,11 +8,13 @@
     "dev": "tsx watch src/index.ts --dev",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx test/roomManager.test.ts && tsx test/integration.test.ts"
+    "test": "tsx test/roomManager.test.ts && tsx test/integration.test.ts && tsx test/qr-pairing.test.ts"
   },
   "dependencies": {
-    "ws": "^8.18.0",
-    "typescript": "^5.7.3"
+    "@types/qrcode": "^1.5.6",
+    "qrcode": "^1.5.4",
+    "typescript": "^5.7.3",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.5",
