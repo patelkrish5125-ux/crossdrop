@@ -1,9 +1,9 @@
-FROM node:20-alpine
+FROM node:20-slim
 WORKDIR /app
 
 # Copy server package definitions
 COPY package*.json ./
-RUN npm install
+RUN npm install --include=optional
 
 # Copy source and build
 COPY tsconfig.json ./

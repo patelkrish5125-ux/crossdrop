@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts --dev",
-    "build": "npx tsc",
+    "build": "tsc",
     "start": "node dist/index.js",
     "test": "tsx test/roomManager.test.ts && tsx test/integration.test.ts"
   },
