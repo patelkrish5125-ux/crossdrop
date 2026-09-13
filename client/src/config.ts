@@ -48,3 +48,20 @@ export function getSignalingConfig(): SignalingConfig {
 export function getSignalingUrl(): string {
   return getSignalingConfig().url;
 }
+
+export function getHealthCheckUrl(): string {
+  const config = getSignalingConfig();
+  if (config.source === 'same-origin' && typeof window !== 'undefined' && window.location) {
+    return `${window.location.origin}/health`;
+  }
+
+  try {
+    const parsed = new URL(config.url);
+    parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
+    parsed.pathname = '/health';
+    return parsed.toString();
+  } catch {
+    return '/health';
+  }
+}
+

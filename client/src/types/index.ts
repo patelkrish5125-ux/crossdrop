@@ -1,6 +1,7 @@
 export type ConnectionState =
   | 'Disconnected'
   | 'Connecting'
+  | 'Waking'
   | 'Connected'
   | 'Transferring'
   | 'Completed'

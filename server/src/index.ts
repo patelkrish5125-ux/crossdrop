@@ -66,12 +66,22 @@ const server = http.createServer((req, res) => {
 
   // Health check endpoint
   if (pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+    if (req.method === 'HEAD') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    res.writeHead(200);
     res.end(
       JSON.stringify({
         status: 'ok',
         service: 'crossdrop-unified',
         activeRooms: roomManager.activeRoomCount,
+        uptime: Math.floor(process.uptime()),
         staticDir: STATIC_DIR ? path.basename(STATIC_DIR) : null,
         timestamp: new Date().toISOString(),
       })
@@ -126,7 +136,29 @@ const server = http.createServer((req, res) => {
   res.end('Not Found');
 });
 
+interface HeartbeatWebSocket extends WebSocket {
+  isAlive?: boolean;
+}
+
 const wss = new WebSocketServer({ server });
+
+// WebSocket heartbeat to prevent idle connection dropouts across cloud reverse-proxies
+const WS_HEARTBEAT_INTERVAL = 30000;
+const wsHeartbeatTimer = setInterval(() => {
+  wss.clients.forEach((client) => {
+    const hbClient = client as HeartbeatWebSocket;
+    if (hbClient.isAlive === false) {
+      console.log('[WebSocket] Terminating unresponsive socket.');
+      return hbClient.terminate();
+    }
+    hbClient.isAlive = false;
+    hbClient.ping();
+  });
+}, WS_HEARTBEAT_INTERVAL);
+
+wss.on('close', () => {
+  clearInterval(wsHeartbeatTimer);
+});
 
 function send(ws: WebSocket, message: ServerMessage) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -145,6 +177,12 @@ setInterval(() => {
 wss.on('connection', (ws: WebSocket, req) => {
   const clientIp = req.socket.remoteAddress;
   console.log(`[WebSocket] New client connected from ${clientIp}`);
+
+  const hbWs = ws as HeartbeatWebSocket;
+  hbWs.isAlive = true;
+  hbWs.on('pong', () => {
+    hbWs.isAlive = true;
+  });
 
   ws.on('message', (raw: Buffer | string) => {
     try {
@@ -308,6 +346,62 @@ function getLocalIp(): string {
   return 'localhost';
 }
 
+// Keep-Alive Service for Render Free Tier / Cloud Hosting
+// Note: Render Free spins down after 15m of no incoming external traffic.
+// To keep the service responsive without creating fake users, rooms, or WebRTC sessions,
+// a periodic non-blocking HTTP ping is sent to the public service URL.
+const KEEP_ALIVE_ENABLED = process.env.KEEP_ALIVE_ENABLED === 'true' || Boolean(process.env.KEEP_ALIVE_URL);
+const KEEP_ALIVE_INTERVAL = parseInt(process.env.KEEP_ALIVE_INTERVAL || '60000', 10);
+const KEEP_ALIVE_URL =
+  process.env.KEEP_ALIVE_URL ||
+  (process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL}/health` : null);
+
+let keepAliveTimer: NodeJS.Timeout | null = null;
+
+function initKeepAlive() {
+  if (!KEEP_ALIVE_ENABLED) {
+    return;
+  }
+
+  if (!KEEP_ALIVE_URL) {
+    console.log('[KeepAlive] KEEP_ALIVE_ENABLED is true, but no KEEP_ALIVE_URL or RENDER_EXTERNAL_URL was configured.');
+    console.log('[KeepAlive] Tip: Set KEEP_ALIVE_URL=https://<your-service>.onrender.com/health in environment variables.');
+    return;
+  }
+
+  console.log(`[KeepAlive] Service active: pinging ${KEEP_ALIVE_URL} every ${KEEP_ALIVE_INTERVAL / 1000}s`);
+
+  const ping = async () => {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch(KEEP_ALIVE_URL, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'CrossDrop-KeepAlive/1.0',
+          'Accept': 'application/json',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        console.warn(`[KeepAlive] Ping to ${KEEP_ALIVE_URL} returned HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.warn(`[KeepAlive] Ping failed: ${err.message || err}`);
+      }
+    }
+  };
+
+  // Run initial ping after 5s and then periodically
+  setTimeout(ping, 5000);
+  keepAliveTimer = setInterval(ping, KEEP_ALIVE_INTERVAL);
+  if (keepAliveTimer.unref) {
+    keepAliveTimer.unref();
+  }
+}
+
 server.listen(PORT, HOST, () => {
   const lanIp = getLocalIp();
   console.log(`\n==================================================`);
@@ -320,5 +414,9 @@ server.listen(PORT, HOST, () => {
   } else {
     console.log('[Server] (Development mode: frontend is served separately by Vite)');
   }
+
+  // Start keep-alive ping engine if configured
+  initKeepAlive();
 });
+
 

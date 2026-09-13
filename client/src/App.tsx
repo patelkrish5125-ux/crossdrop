@@ -125,6 +125,14 @@ export default function App() {
           console.log('[CrossDrop App] Signaling status:', statusText);
         }
       },
+      onStatusChange: (status, statusText) => {
+        if (status === 'waking') {
+          setConnectionState('Waking');
+        } else if (status === 'connecting') {
+          setConnectionState('Connecting');
+        }
+        console.log('[CrossDrop App] Status changed:', status, statusText);
+      },
       onError: (_code, message) => {
         setErrorMessage(message);
         setConnectionState('Disconnected');
@@ -273,7 +281,7 @@ export default function App() {
           className={`status-banner ${
             connectionState === 'Connected'
               ? 'connected'
-              : connectionState === 'Connecting'
+              : connectionState === 'Connecting' || connectionState === 'Waking'
               ? 'connecting'
               : 'error'
           }`}
@@ -282,10 +290,20 @@ export default function App() {
           <span>
             {connectionState === 'Connected'
               ? '✓ Connected'
+              : connectionState === 'Waking'
+              ? '⏳ Waking server (Render free tier cold start ~30s)...'
               : connectionState === 'Connecting'
               ? 'Connecting...'
               : connectionState}
           </span>
+        </div>
+      )}
+
+      {/* Global Waking Indicator when on Home or Joining Screen */}
+      {connectionState === 'Waking' && (step === 'home' || step === 'joining_room') && (
+        <div className="status-banner connecting" style={{ marginBottom: '1rem' }}>
+          <span className="status-dot" />
+          <span>⏳ Waking server (Render free tier cold start ~30s)... please wait</span>
         </div>
       )}
 
