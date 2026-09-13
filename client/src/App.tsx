@@ -11,6 +11,8 @@ import { SignalingClient } from './services/signaling.ts';
 import { WebRTCService } from './services/webrtc.ts';
 import { getSignalingConfig } from './config.ts';
 import { generateQRCodeSVG } from './utils/qr.ts';
+import { extractDroppedFiles } from './utils/fileDrop.ts';
+import { createZipBlob } from './utils/zip.ts';
 
 type AppStep =
   | 'home'
@@ -96,6 +98,7 @@ export default function App() {
   const [sessionHistory, setSessionHistory] = useState<SessionHistoryItem[]>([]);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [folderNotice, setFolderNotice] = useState<string>('');
+  const [isZipping, setIsZipping] = useState<boolean>(false);
 
   // Folder transfer support detection
   const isFolderSupported = typeof window !== 'undefined' && 'webkitdirectory' in document.createElement('input');
@@ -362,14 +365,21 @@ export default function App() {
     setIsDragging(false);
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const filesArray = Array.from(e.dataTransfer.files);
-      setSelectedFiles((prev) => [...prev, ...filesArray]);
-      setErrorMessage('');
+    try {
+      const filesArray = await extractDroppedFiles(e.dataTransfer);
+      if (filesArray.length > 0) {
+        setSelectedFiles((prev) => [...prev, ...filesArray]);
+        setErrorMessage('');
+      }
+    } catch {
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        setSelectedFiles((prev) => [...prev, ...Array.from(e.dataTransfer.files)]);
+        setErrorMessage('');
+      }
     }
   };
 
@@ -392,7 +402,7 @@ export default function App() {
     webrtcRef.current?.resumeTransfer(transferId);
   };
 
-  const handleCancelTransfer = (transferId: string) => {
+  const handleCancelTransfer = (transferId?: string) => {
     webrtcRef.current?.cancelTransfer(transferId);
   };
 
@@ -414,6 +424,31 @@ export default function App() {
     receivedFiles.forEach((file, index) => {
       setTimeout(() => handleDownload(file), index * 300);
     });
+  };
+
+  const handleDownloadAsZip = async () => {
+    if (receivedFiles.length === 0) return;
+    setIsZipping(true);
+    try {
+      const zipInputs = receivedFiles.map((f) => ({
+        path: f.relativePath || f.name,
+        data: f.blob,
+      }));
+      const zipBlob = await createZipBlob(zipInputs);
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      const firstFolder = receivedFiles.find((f) => f.relativePath)?.relativePath?.split('/')[0];
+      a.download = firstFolder ? `${firstFolder}.zip` : 'CrossDrop_Files.zip';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (err) {
+      console.error('[CrossDrop] Failed to create ZIP:', err);
+    } finally {
+      setIsZipping(false);
+    }
   };
 
   const handleFullReset = () => {
@@ -458,6 +493,13 @@ export default function App() {
 
   const totalSelectedBytes = selectedFiles.reduce((acc, f) => acc + f.size, 0);
   const activeTransfers = transferQueue.filter((q) => q.status === 'transferring' || q.status === 'receiving');
+  const hasActiveTransfers = transferQueue.some(
+    (q) =>
+      q.status === 'transferring' ||
+      q.status === 'receiving' ||
+      q.status === 'waiting' ||
+      q.status === 'paused'
+  );
   const connectedPeerCount = remotePeers.filter((p) => p.status === 'connected').length;
 
   return (
@@ -716,7 +758,22 @@ export default function App() {
                 <span className="speed-hero-label">Real Measured Throughput</span>
               </div>
               <div style={{ textAlign: 'right', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                <div>ETA: <strong>{formatEta(progress.etaSeconds)}</strong></div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem', marginBottom: '0.2rem' }}>
+                  <span style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem',
+                    background: 'rgba(16, 185, 129, 0.15)',
+                    color: '#34d399',
+                    borderRadius: '4px',
+                    padding: '0.1rem 0.4rem',
+                    fontSize: '0.7rem',
+                    fontWeight: 600,
+                  }}>
+                    ⚡ Background Active
+                  </span>
+                  <span>ETA: <strong>{formatEta(progress.etaSeconds)}</strong></span>
+                </div>
                 <div>{formatBytes(progress.overallTransferredBytes)} / {formatBytes(progress.overallTotalBytes)} ({progress.overallPercentage}%)</div>
               </div>
             </div>
@@ -843,15 +900,25 @@ export default function App() {
           {/* Concurrent Transfer Queue */}
           {transferQueue.length > 0 && (
             <div style={{ width: '100%', marginTop: '1rem' }}>
-              <div className="queue-summary" style={{ marginBottom: '0.5rem' }}>
-                <span>Transfer Queue ({transferQueue.length})</span>
-                <button
-                  className="btn-link"
-                  style={{ background: 'transparent', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.8rem' }}
-                  onClick={() => webrtcRef.current?.cancelTransfer()}
-                >
-                  Cancel All
-                </button>
+              <div className="queue-summary" style={{ marginBottom: '0.5rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontWeight: 600 }}>Transfer Queue ({transferQueue.length})</span>
+                {hasActiveTransfers && (
+                  <button
+                    className="btn-icon-sm danger"
+                    style={{
+                      padding: '0.3rem 0.75rem',
+                      fontWeight: 600,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      fontSize: '0.8rem',
+                    }}
+                    onClick={() => handleCancelTransfer()}
+                    title="Cancel all transfers for both devices"
+                  >
+                    ✕ Cancel Transfer
+                  </button>
+                )}
               </div>
 
               <div className="queue-items-container">
@@ -909,8 +976,8 @@ export default function App() {
                             ▶
                           </button>
                         )}
-                        {(item.status === 'transferring' || item.status === 'waiting' || item.status === 'paused') && (
-                          <button className="btn-icon-sm danger" onClick={() => handleCancelTransfer(item.transferId)} title="Cancel">
+                        {(item.status === 'transferring' || item.status === 'receiving' || item.status === 'waiting' || item.status === 'paused') && (
+                          <button className="btn-icon-sm danger" onClick={() => handleCancelTransfer(item.transferId)} title="Cancel transfer (cancels on both devices)">
                             ✕
                           </button>
                         )}
@@ -944,17 +1011,29 @@ export default function App() {
           {/* Received Files Downloads List */}
           {receivedFiles.length > 0 && (
             <div style={{ width: '100%', marginTop: '1rem' }}>
-              <div className="queue-summary" style={{ marginBottom: '0.5rem' }}>
-                <span>Received Files ({receivedFiles.length})</span>
-                {receivedFiles.length > 1 && (
-                  <button
-                    className="btn-link"
-                    style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: '0.85rem' }}
-                    onClick={handleDownloadAll}
-                  >
-                    Download All
-                  </button>
-                )}
+              <div className="queue-summary" style={{ marginBottom: '0.5rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontWeight: 600 }}>Received Files ({receivedFiles.length})</span>
+                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                  {(receivedFiles.some((f) => f.relativePath) || receivedFiles.length > 1) && (
+                    <button
+                      className="btn-link"
+                      style={{ background: 'transparent', border: 'none', color: '#10b981', cursor: 'pointer', fontSize: '0.85rem', fontWeight: 600 }}
+                      onClick={handleDownloadAsZip}
+                      disabled={isZipping}
+                    >
+                      {isZipping ? '⏳ Creating ZIP...' : '📦 Download as ZIP'}
+                    </button>
+                  )}
+                  {receivedFiles.length > 1 && (
+                    <button
+                      className="btn-link"
+                      style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: '0.85rem' }}
+                      onClick={handleDownloadAll}
+                    >
+                      Download All
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="received-list">
                 {receivedFiles.map((file, idx) => (

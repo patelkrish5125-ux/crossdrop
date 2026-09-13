@@ -8,12 +8,14 @@ import type {
   TransferProgress,
   TransferQueueItem,
 } from '../types/index.ts';
+import { backgroundManager } from './background.ts';
 
 // Phase 3 High-Performance WebRTC Configuration
 export const CHUNK_SIZE = 64 * 1024; // 64 KB optimized chunk size (SCTP max message without IP fragmentation)
-export const BUFFER_HIGH_WATERMARK = 1024 * 1024; // 1 MB max buffered amount before pausing
-export const BUFFER_LOW_WATERMARK = 256 * 1024; // 256 KB threshold for unpausing via onbufferedamountlow
+export const BUFFER_HIGH_WATERMARK = 4 * 1024 * 1024; // 4 MB pipelined high watermark for maximum throughput
+export const BUFFER_LOW_WATERMARK = 1024 * 1024; // 1 MB low watermark threshold for continuous drain
 export const MAX_CONCURRENT_TRANSFERS = 3; // Bounded concurrent file transfers
+const DISK_BATCH_SIZE = 2 * 1024 * 1024; // 2 MB disk read batch size to eliminate single-chunk disk I/O latency
 
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
@@ -27,6 +29,15 @@ const RTC_CONFIG: RTCConfiguration = {
 const MAGIC_BYTE = 0xcd; // CrossDrop packet identifier
 const TYPE_CHUNK = 0x01;
 const HEADER_SIZE = 26; // 1 byte magic + 1 byte type + 16 bytes transferId + 4 bytes chunkIdx + 4 bytes totalChunks
+
+export function generateTransferId(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 16; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
 
 export interface WebRTCCallbacks {
   onConnectionStateChange?: (state: ConnectionState, peerId?: string) => void;
@@ -54,7 +65,7 @@ export class TransferSpeedTracker {
     const now = Date.now();
     const elapsed = (now - this.lastTime) / 1000;
 
-    if (elapsed >= 0.2) {
+    if (elapsed >= 0.15) {
       const deltaBytes = Math.max(0, currentBytes - this.lastBytes);
       const instantSpeed = deltaBytes / elapsed;
       this.currentSpeed = this.currentSpeed === 0 ? instantSpeed : this.currentSpeed * 0.7 + instantSpeed * 0.3;
@@ -94,6 +105,7 @@ interface IncomingTransferSession {
   transferId: string;
   meta: FileMetadata;
   receivedChunks: ArrayBuffer[];
+  chunksReceivedCount: number;
   receivedBytes: number;
   speedTracker: TransferSpeedTracker;
   startedAt: number;
@@ -234,6 +246,8 @@ export class WebRTCService {
       console.log(`[WebRTC] DataChannel opened for peer ${session.peerId}!`);
       this.setPeerState(session, 'CONNECTED');
       this.sendPeerInfo(session);
+      // Immediately process any queued waiting files
+      this.processQueue();
     };
 
     dc.onclose = () => {
@@ -400,7 +414,7 @@ export class WebRTCService {
     const effectiveTargetId = targetPeer?.peerId;
 
     const newItems: TransferQueueItem[] = files.map((file, idx) => {
-      const transferId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36).substring(4);
+      const transferId = generateTransferId();
       // Check for webkitRelativePath for folder structure preservation
       const relativePath = (file as any).webkitRelativePath || undefined;
 
@@ -435,6 +449,12 @@ export class WebRTCService {
         return session;
       }
     }
+    // Fallback: any session with dc open
+    for (const session of this.peers.values()) {
+      if (session.dc && session.dc.readyState === 'open') {
+        return session;
+      }
+    }
     return null;
   }
 
@@ -452,6 +472,21 @@ export class WebRTCService {
       if (!item.file) continue;
       this.startFileTransfer(item);
     }
+
+    this.updateBackgroundState();
+  }
+
+  private updateBackgroundState() {
+    const hasActiveTransfers =
+      this.activeOutgoing.size > 0 ||
+      this.activeIncoming.size > 0 ||
+      this.queue.some((q) => q.status === 'transferring' || q.status === 'receiving');
+
+    if (hasActiveTransfers) {
+      backgroundManager.start();
+    } else {
+      backgroundManager.stop();
+    }
   }
 
   private async startFileTransfer(item: TransferQueueItem) {
@@ -459,13 +494,13 @@ export class WebRTCService {
     const targetPeer = item.targetPeerId ? this.peers.get(item.targetPeerId) : this.getFirstConnectedPeer();
 
     if (!targetPeer || !targetPeer.dc || targetPeer.dc.readyState !== 'open') {
-      item.status = 'failed';
-      item.error = 'Selected destination peer is not connected.';
+      // Keep waiting if connection is still establishing
+      item.status = 'waiting';
       this.callbacks.onQueueUpdate?.([...this.queue]);
       return;
     }
 
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     const meta: FileMetadata = {
       id: item.id,
       transferId: item.transferId,
@@ -493,6 +528,7 @@ export class WebRTCService {
     };
 
     this.activeOutgoing.set(item.transferId, task);
+    this.updateBackgroundState();
 
     // Send control frame: file-start
     try {
@@ -517,7 +553,7 @@ export class WebRTCService {
   }
 
   /**
-   * Pipelined chunk streaming engine using 64 KB chunks and bufferedAmountLowThreshold backpressure.
+   * Pipelined chunk streaming engine using 64 KB chunks, 2 MB disk batching, and continuous backpressure.
    */
   private async streamChunks(task: OutgoingTransferTask, session: PeerSession) {
     const file = task.item.file!;
@@ -529,7 +565,18 @@ export class WebRTCService {
     const transferIdBytes = new Uint8Array(16);
     transferIdBytes.set(encoder.encode(task.meta.transferId).slice(0, 16));
 
-    while (task.currentChunkIndex < task.meta.totalChunks) {
+    // Disk read batch caching: reads 2 MB at a time to eliminate per-chunk disk I/O bottlenecks
+    let batchStart = -1;
+    let batchEnd = -1;
+    let batchBuffer: ArrayBuffer | null = null;
+
+    // Handle 0-byte files immediately
+    if (file.size === 0) {
+      task.item.transferredBytes = 0;
+      task.item.percentage = 100;
+    }
+
+    while (task.currentChunkIndex < task.meta.totalChunks && file.size > 0) {
       if (task.isCancelled) {
         return;
       }
@@ -553,22 +600,40 @@ export class WebRTCService {
       // Check DataChannel backpressure: if buffer is high, wait for onbufferedamountlow
       if (dc.bufferedAmount >= BUFFER_HIGH_WATERMARK) {
         await new Promise<void>((resolve) => {
+          if (dc.bufferedAmount <= BUFFER_LOW_WATERMARK) {
+            resolve();
+            return;
+          }
+          let timer: any = null;
           const onLow = () => {
             dc.removeEventListener('bufferedamountlow', onLow);
+            if (timer) clearTimeout(timer);
             resolve();
           };
           dc.addEventListener('bufferedamountlow', onLow);
+          timer = setTimeout(() => {
+            dc.removeEventListener('bufferedamountlow', onLow);
+            resolve();
+          }, 80); // 80ms fallback check to avoid any browser event missed-transition deadlocks
         });
       }
 
-      // Slice only the current 64 KB chunk on-demand (zero full-file RAM footprint)
-      const start = task.currentChunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, file.size);
-      const chunkBlob = file.slice(start, end);
-      const chunkData = await chunkBlob.arrayBuffer();
+      const chunkStart = task.currentChunkIndex * CHUNK_SIZE;
+      const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, file.size);
+      const chunkSize = chunkEnd - chunkStart;
+
+      // Ensure batch slice is cached in memory
+      if (!batchBuffer || chunkStart < batchStart || chunkEnd > batchEnd) {
+        batchStart = chunkStart;
+        batchEnd = Math.min(batchStart + DISK_BATCH_SIZE, file.size);
+        batchBuffer = await file.slice(batchStart, batchEnd).arrayBuffer();
+      }
+
+      const offsetInBatch = chunkStart - batchStart;
+      const chunkSlice = new Uint8Array(batchBuffer, offsetInBatch, chunkSize);
 
       // Build binary packet with 26-byte compact header
-      const packet = new Uint8Array(HEADER_SIZE + chunkData.byteLength);
+      const packet = new Uint8Array(HEADER_SIZE + chunkSize);
       packet[0] = MAGIC_BYTE;
       packet[1] = TYPE_CHUNK;
       packet.set(transferIdBytes, 2);
@@ -576,7 +641,7 @@ export class WebRTCService {
       const view = new DataView(packet.buffer);
       view.setUint32(18, task.currentChunkIndex, false); // Big endian chunk index
       view.setUint32(22, task.meta.totalChunks, false); // Big endian total chunks
-      packet.set(new Uint8Array(chunkData), HEADER_SIZE);
+      packet.set(chunkSlice, HEADER_SIZE);
 
       try {
         dc.send(packet.buffer);
@@ -591,16 +656,16 @@ export class WebRTCService {
       }
 
       task.currentChunkIndex++;
-      task.item.transferredBytes = end;
-      task.item.percentage = Math.round((end / file.size) * 100);
+      task.item.transferredBytes = chunkEnd;
+      task.item.percentage = file.size > 0 ? Math.round((chunkEnd / file.size) * 100) : 100;
 
       // Update per-file speed & ETA
-      const { speed, eta } = speedTracker.update(end, file.size);
+      const { speed, eta } = speedTracker.update(chunkEnd, file.size);
       task.item.speedBytesPerSec = speed;
       task.item.etaSeconds = eta;
 
       // Update aggregate throughput
-      this.totalTransferredSessionBytes += chunkData.byteLength;
+      this.totalTransferredSessionBytes += chunkSize;
       this.emitProgressUpdate(task.item);
     }
 
@@ -614,6 +679,8 @@ export class WebRTCService {
     task.item.sha256 = hash;
     task.item.integrityVerified = true;
     task.item.completedAt = Date.now();
+    task.item.speedBytesPerSec = 0;
+    task.item.etaSeconds = null;
 
     // Send control frame: file-complete with SHA-256
     try {
@@ -628,7 +695,7 @@ export class WebRTCService {
     } catch {}
 
     // Record in session history
-    const durationMs = (task.item.completedAt || Date.now()) - (task.item.startedAt || Date.now());
+    const durationMs = Math.max(1, (task.item.completedAt || Date.now()) - (task.item.startedAt || Date.now()));
     this.sessionHistory.unshift({
       id: task.item.id,
       fileName: task.item.name,
@@ -682,7 +749,7 @@ export class WebRTCService {
 
     let incoming = this.activeIncoming.get(transferId);
     if (!incoming) {
-      // In case file-start was delayed, instantiate fallback session
+      // In case file-start was delayed or dropped, instantiate fallback session
       incoming = {
         transferId,
         meta: {
@@ -697,6 +764,7 @@ export class WebRTCService {
           totalFiles: 1,
         },
         receivedChunks: new Array(totalChunks),
+        chunksReceivedCount: 0,
         receivedBytes: 0,
         speedTracker: new TransferSpeedTracker(),
         startedAt: Date.now(),
@@ -705,8 +773,11 @@ export class WebRTCService {
       this.activeIncoming.set(transferId, incoming);
     }
 
-    incoming.receivedChunks[chunkIndex] = payload;
-    incoming.receivedBytes += payload.byteLength;
+    if (!incoming.receivedChunks[chunkIndex]) {
+      incoming.receivedChunks[chunkIndex] = payload;
+      incoming.chunksReceivedCount++;
+      incoming.receivedBytes += payload.byteLength;
+    }
 
     // Update queue item for UI tracking
     let queueItem = this.queue.find((q) => q.transferId === transferId);
@@ -723,27 +794,26 @@ export class WebRTCService {
         targetPeerName: session.name,
         status: 'receiving',
         transferredBytes: incoming.receivedBytes,
-        percentage: Math.round((incoming.receivedBytes / incoming.meta.size) * 100),
+        percentage: incoming.meta.size > 0 ? Math.round((incoming.receivedBytes / incoming.meta.size) * 100) : 100,
         speedBytesPerSec: 0,
         etaSeconds: null,
       };
       this.queue.push(queueItem);
     } else {
       queueItem.transferredBytes = incoming.receivedBytes;
-      queueItem.percentage = Math.round((incoming.receivedBytes / incoming.meta.size) * 100);
+      queueItem.percentage =
+        incoming.meta.size > 0 ? Math.round((incoming.receivedBytes / incoming.meta.size) * 100) : 100;
       const { speed, eta } = incoming.speedTracker.update(incoming.receivedBytes, incoming.meta.size);
       queueItem.speedBytesPerSec = speed;
       queueItem.etaSeconds = eta;
     }
 
+    this.updateBackgroundState();
     this.emitProgressUpdate(queueItem);
 
-    // Check if file is completely received
-    if (incoming.receivedBytes >= incoming.meta.size || chunkIndex === totalChunks - 1) {
-      const isAllPresent = incoming.receivedChunks.filter(Boolean).length === totalChunks;
-      if (isAllPresent) {
-        await this.finalizeIncomingFile(incoming, queueItem, session);
-      }
+    // Check if file is completely received (O(1) counter comparison)
+    if (incoming.chunksReceivedCount >= incoming.meta.totalChunks || incoming.receivedBytes >= incoming.meta.size) {
+      await this.finalizeIncomingFile(incoming, queueItem, session);
     }
   }
 
@@ -753,7 +823,8 @@ export class WebRTCService {
     session: PeerSession
   ) {
     // Assemble Blob from ordered chunks
-    const blob = new Blob(incoming.receivedChunks, { type: incoming.meta.mimeType });
+    const validChunks = incoming.receivedChunks.filter(Boolean);
+    const blob = new Blob(validChunks, { type: incoming.meta.mimeType });
     const url = URL.createObjectURL(blob);
 
     // Compute SHA-256 hash
@@ -771,6 +842,8 @@ export class WebRTCService {
     queueItem.receivedBlob = blob;
     queueItem.downloadUrl = url;
     queueItem.completedAt = Date.now();
+    queueItem.speedBytesPerSec = 0;
+    queueItem.etaSeconds = null;
 
     // Verify integrity if sender sent hash
     let integrityVerified = true;
@@ -781,6 +854,20 @@ export class WebRTCService {
     } else {
       queueItem.integrityVerified = true;
     }
+
+    const durationMs = Math.max(1, queueItem.completedAt - incoming.startedAt);
+    this.sessionHistory.unshift({
+      id: queueItem.id,
+      fileName: queueItem.name,
+      size: blob.size,
+      direction: 'received',
+      peerName: session.name || 'Peer',
+      speedBytesPerSec: durationMs > 0 ? Math.round((blob.size / durationMs) * 1000) : 0,
+      durationMs,
+      timestamp: Date.now(),
+      integrityVerified,
+    });
+    this.callbacks.onSessionHistory?.([...this.sessionHistory]);
 
     const receivedFile: ReceivedFile = {
       id: incoming.meta.id || incoming.transferId,
@@ -797,33 +884,26 @@ export class WebRTCService {
       integrityVerified,
     };
 
+    backgroundManager.notify(
+      'CrossDrop File Received',
+      `${incoming.meta.name} received successfully.`
+    );
+
     this.callbacks.onFileReceived?.(receivedFile);
     this.callbacks.onQueueUpdate?.([...this.queue]);
-
-    // Record in session history
-    const durationMs = Date.now() - incoming.startedAt;
-    this.sessionHistory.unshift({
-      id: queueItem.id,
-      fileName: incoming.meta.name,
-      size: blob.size,
-      direction: 'received',
-      peerName: session.name,
-      speedBytesPerSec: durationMs > 0 ? Math.round((blob.size / durationMs) * 1000) : 0,
-      durationMs,
-      timestamp: Date.now(),
-      integrityVerified,
-    });
-    this.callbacks.onSessionHistory?.([...this.sessionHistory]);
+    this.updateBackgroundState();
   }
 
   private handleControlMessage(msg: any, session: PeerSession) {
     switch (msg.action) {
       case 'peer-info': {
-        if (msg.name) {
-          session.name = msg.name;
-          this.callbacks.onPeerInfo?.({ name: msg.name, id: session.peerId });
-          this.notifyPeerList();
-        }
+        session.name = msg.name || 'Remote Device';
+        this.notifyPeerList();
+        this.callbacks.onPeerInfo?.({
+          id: session.peerId,
+          name: session.name,
+          platform: 'WebRTC Peer',
+        });
         break;
       }
 
@@ -833,6 +913,7 @@ export class WebRTCService {
           transferId: meta.transferId,
           meta,
           receivedChunks: new Array(meta.totalChunks),
+          chunksReceivedCount: 0,
           receivedBytes: 0,
           speedTracker: new TransferSpeedTracker(),
           startedAt: Date.now(),
@@ -857,6 +938,15 @@ export class WebRTCService {
         };
         this.queue.push(queueItem);
         this.callbacks.onQueueUpdate?.([...this.queue]);
+        this.updateBackgroundState();
+
+        // If 0-byte file, complete immediately
+        if (meta.size === 0) {
+          const incoming = this.activeIncoming.get(meta.transferId);
+          if (incoming) {
+            this.finalizeIncomingFile(incoming, queueItem, session);
+          }
+        }
         break;
       }
 
@@ -893,28 +983,18 @@ export class WebRTCService {
         break;
       }
 
+      case 'cancel-all':
       case 'cancel': {
-        const outgoing = this.activeOutgoing.get(msg.transferId);
-        if (outgoing) {
-          outgoing.isCancelled = true;
-          outgoing.item.status = 'cancelled';
-          this.activeOutgoing.delete(msg.transferId);
-        }
-        const incoming = this.activeIncoming.get(msg.transferId);
-        if (incoming) {
-          incoming.receivedChunks = [];
-          this.activeIncoming.delete(msg.transferId);
-          const q = this.queue.find((i) => i.transferId === msg.transferId);
-          if (q) q.status = 'cancelled';
-        }
-        this.callbacks.onQueueUpdate?.([...this.queue]);
-        this.processQueue();
+        // As requested: if one single cancels it, it cancels whole download for both parties
+        const reason = msg.reason || 'Transfer was cancelled by the connected device.';
+        this.cancelAllTransfers(reason, false);
+        backgroundManager.notify('CrossDrop Transfer Cancelled', reason);
         break;
       }
     }
   }
 
-  // --- Actions: Pause, Resume, Cancel ---
+  // --- Universal Queue Actions: Pause, Resume, Cancel All ---
 
   public pauseTransfer(transferId: string): void {
     const task = this.activeOutgoing.get(transferId);
@@ -941,7 +1021,6 @@ export class WebRTCService {
         this.callbacks.onQueueUpdate?.([...this.queue]);
         this.streamChunks(task, session);
       } else if (item.file && session) {
-        // Re-queue
         item.status = 'waiting';
         this.callbacks.onQueueUpdate?.([...this.queue]);
         this.processQueue();
@@ -951,7 +1030,7 @@ export class WebRTCService {
       const incoming = this.activeIncoming.get(transferId);
       const session = item.targetPeerId ? this.peers.get(item.targetPeerId) : this.getFirstConnectedPeer();
       if (incoming && session?.dc) {
-        const lastChunk = incoming.receivedChunks.filter(Boolean).length;
+        const lastChunk = incoming.chunksReceivedCount;
         session.dc.send(
           JSON.stringify({
             type: 'control',
@@ -966,49 +1045,68 @@ export class WebRTCService {
     }
   }
 
-  public cancelTransfer(transferId?: string): void {
-    if (transferId) {
-      const outgoing = this.activeOutgoing.get(transferId);
-      if (outgoing) {
-        outgoing.isCancelled = true;
-        outgoing.item.status = 'cancelled';
-        const session = outgoing.targetPeerId ? this.peers.get(outgoing.targetPeerId) : this.getFirstConnectedPeer();
-        try {
-          session?.dc?.send(JSON.stringify({ type: 'control', action: 'cancel', transferId }));
-        } catch {}
-        this.activeOutgoing.delete(transferId);
+  /**
+   * Universal cancel: Cancels the entire transfer batch on BOTH sides immediately.
+   * If sender or receiver triggers cancel, both sides halt all streams and mark items cancelled.
+   */
+  public cancelAllTransfers(reason = 'Transfer cancelled', notifyPeers = true): void {
+    // 1. Cancel all outgoing tasks
+    for (const task of this.activeOutgoing.values()) {
+      task.isCancelled = true;
+      task.item.status = 'cancelled';
+      task.item.error = reason;
+      task.item.speedBytesPerSec = 0;
+      task.item.etaSeconds = null;
+    }
+    this.activeOutgoing.clear();
+
+    // 2. Clear all incoming sessions and deallocate chunks
+    for (const incoming of this.activeIncoming.values()) {
+      incoming.receivedChunks = [];
+    }
+    this.activeIncoming.clear();
+
+    // 3. Mark all active, transferring, receiving, or waiting items as cancelled
+    for (const item of this.queue) {
+      if (
+        item.status === 'transferring' ||
+        item.status === 'receiving' ||
+        item.status === 'waiting' ||
+        item.status === 'paused'
+      ) {
+        item.status = 'cancelled';
+        item.error = reason;
+        item.speedBytesPerSec = 0;
+        item.etaSeconds = null;
       }
-      const incoming = this.activeIncoming.get(transferId);
-      if (incoming) {
-        incoming.receivedChunks = [];
-        this.activeIncoming.delete(transferId);
-        const item = this.queue.find((q) => q.transferId === transferId);
-        if (item) item.status = 'cancelled';
-      }
-    } else {
-      // Cancel all active transfers
-      for (const [id, task] of this.activeOutgoing.entries()) {
-        task.isCancelled = true;
-        task.item.status = 'cancelled';
-        const session = task.targetPeerId ? this.peers.get(task.targetPeerId) : this.getFirstConnectedPeer();
-        try {
-          session?.dc?.send(JSON.stringify({ type: 'control', action: 'cancel', transferId: id }));
-        } catch {}
-      }
-      this.activeOutgoing.clear();
-      for (const incoming of this.activeIncoming.values()) {
-        incoming.receivedChunks = [];
-      }
-      this.activeIncoming.clear();
-      for (const item of this.queue) {
-        if (item.status === 'transferring' || item.status === 'waiting') {
-          item.status = 'cancelled';
+    }
+
+    // 4. Notify all connected peers over open DataChannels
+    if (notifyPeers) {
+      const cancelPayload = JSON.stringify({
+        type: 'control',
+        action: 'cancel-all',
+        reason,
+      });
+      for (const session of this.peers.values()) {
+        if (session.dc && session.dc.readyState === 'open') {
+          try {
+            session.dc.send(cancelPayload);
+          } catch {}
         }
       }
     }
 
+    backgroundManager.stop();
     this.callbacks.onQueueUpdate?.([...this.queue]);
     this.processQueue();
+  }
+
+  /**
+   * Cancel transfer handler: Cancels the whole download/transfer batch as requested.
+   */
+  public cancelTransfer(_transferId?: string): void {
+    this.cancelAllTransfers('Transfer cancelled by user', true);
   }
 
   public retryTransfer(transferId: string): void {
@@ -1066,7 +1164,7 @@ export class WebRTCService {
   }
 
   public cleanup(): void {
-    this.cancelTransfer();
+    this.cancelAllTransfers('Session closed', false);
     for (const session of this.peers.values()) {
       try {
         session.dc?.close();
