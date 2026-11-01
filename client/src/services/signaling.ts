@@ -26,6 +26,12 @@ export class SignalingClient {
   private isWaking = false;
   private abortWaking = false;
   private myPeerId: string | null = null;
+  private currentRoomId: string | null = null;
+
+  // Latency & diagnostics
+  private latencyMs: number | null = null;
+  private pingIntervalTimer: any = null;
+  private lastErrorText: string | null = null;
 
   // Reconnection state
   private currentRoomCode: string | null = null;
@@ -60,15 +66,31 @@ export class SignalingClient {
     return this.currentRoomCode;
   }
 
+  public get activeRoomId(): string | null {
+    return this.currentRoomId;
+  }
+
   public get localPeerId(): string | null {
     return this.myPeerId;
+  }
+
+  public get latency(): number | null {
+    return this.latencyMs;
+  }
+
+  public get reconnectCount(): number {
+    return this.reconnectAttempts;
+  }
+
+  public get lastError(): string | null {
+    return this.lastErrorText;
   }
 
   private notifyState(state: ConnectionState, text?: string) {
     this.callbacks.onStateChange?.(state, text);
     if (state === 'SIGNALING_CONNECTED' || state === 'CONNECTED') {
       this.callbacks.onConnectionChange?.(true, text || 'Connected');
-    } else if (state === 'DISCONNECTED' || state === 'ERROR') {
+    } else if (state === 'DISCONNECTED' || state === 'ERROR' || state === 'FAILED') {
       this.callbacks.onConnectionChange?.(false, text || 'Disconnected');
     }
   }
@@ -136,6 +158,7 @@ export class SignalingClient {
     if (!this.url) {
       const errMsg = 'Signaling server URL is not configured.';
       console.error('[CrossDrop Signaling] Connection blocked: ' + errMsg);
+      this.lastErrorText = errMsg;
       this.callbacks.onError?.('SERVER_CONNECTION_ERROR', 'Could not connect to signaling server.');
       return Promise.reject(new Error(errMsg));
     }
@@ -171,6 +194,7 @@ export class SignalingClient {
           this.reconnectAttempts = 0;
           this.notifyState('SIGNALING_CONNECTED', 'Connected to signaling server');
           console.log(`[CrossDrop Signaling] WebSocket connected to ${this.url}`);
+          this.startHeartbeatPing();
           if (!isSettled) {
             isSettled = true;
             resolve();
@@ -179,6 +203,7 @@ export class SignalingClient {
 
         socket.onclose = (event) => {
           this.isConnecting = false;
+          this.stopHeartbeatPing();
           this.ws = null;
           console.log(`[CrossDrop Signaling] WebSocket closed (code: ${event.code}, reason: ${event.reason || 'none'})`);
 
@@ -197,6 +222,7 @@ export class SignalingClient {
         socket.onerror = (event) => {
           this.isConnecting = false;
           console.error('[CrossDrop Signaling] WebSocket connection error target:', this.url, event);
+          this.lastErrorText = 'Signaling connection error';
           if (!isSettled) {
             isSettled = true;
             reject(new Error('Could not connect to signaling server.'));
@@ -211,19 +237,42 @@ export class SignalingClient {
             console.error('[CrossDrop Signaling] Failed to parse signaling message:', e);
           }
         };
-      } catch (err) {
+      } catch (err: any) {
         this.isConnecting = false;
         console.error('[CrossDrop Signaling] Exception during WebSocket initialization:', err);
+        this.lastErrorText = err.message || 'Exception during WebSocket initialization';
         reject(err);
       }
     });
+  }
+
+  private startHeartbeatPing() {
+    this.stopHeartbeatPing();
+    // Send lightweight latency ping every 15 seconds
+    this.pingIntervalTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.send({
+          type: 'ping',
+          clientTime: Date.now(),
+        });
+      }
+    }, 15000);
+  }
+
+  private stopHeartbeatPing() {
+    if (this.pingIntervalTimer) {
+      clearInterval(this.pingIntervalTimer);
+      this.pingIntervalTimer = null;
+    }
   }
 
   private scheduleReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.warn('[CrossDrop Signaling] Max reconnect attempts reached.');
       this.currentRoomCode = null;
-      this.notifyState('ERROR', 'Connection lost. Please rejoin or create a new room.');
+      this.currentRoomId = null;
+      this.lastErrorText = 'Signaling connection lost. The room may have expired.';
+      this.notifyState('FAILED', 'Connection lost. Please rejoin or create a new room.');
       this.callbacks.onError?.(
         'RECONNECT_FAILED',
         'Could not restore signaling connection. The room may have expired.'
@@ -231,10 +280,12 @@ export class SignalingClient {
       return;
     }
 
-    const backoffMs = Math.min(8000, 1000 * Math.pow(2, this.reconnectAttempts));
+    // Bounded exponential backoff with jitter
+    const jitter = Math.random() * 400;
+    const backoffMs = Math.min(8000, 1000 * Math.pow(1.5, this.reconnectAttempts) + jitter);
     this.reconnectAttempts++;
     console.log(
-      `[CrossDrop Signaling] Reconnecting in ${backoffMs / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
+      `[CrossDrop Signaling] Reconnecting in ${(backoffMs / 1000).toFixed(1)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
     );
     this.notifyState('RECONNECTING', `Reconnecting to server (attempt ${this.reconnectAttempts})...`);
 
@@ -253,9 +304,24 @@ export class SignalingClient {
   }
 
   private handleMessage(msg: SignalingServerMessage) {
+    if (msg.roomId) {
+      this.currentRoomId = msg.roomId;
+    }
+
     switch (msg.type) {
+      case 'pong':
+        if (msg.clientTime) {
+          this.latencyMs = Math.max(0, Date.now() - msg.clientTime);
+        }
+        break;
+
+      case 'ack':
+        // Acknowledgment received for client message
+        break;
+
       case 'room-created':
         this.currentRoomCode = msg.code;
+        this.currentRoomId = msg.roomId;
         this.myPeerId = msg.peerId || null;
         this.notifyState('WAITING_FOR_PEER', 'Room created, waiting for peer');
         this.callbacks.onRoomCreated?.(msg.roomId, msg.code, msg.peerId);
@@ -263,6 +329,7 @@ export class SignalingClient {
 
       case 'room-joined':
         this.currentRoomCode = msg.code;
+        this.currentRoomId = msg.roomId;
         this.myPeerId = msg.peerId || null;
         this.notifyState('NEGOTIATING', 'Joined room, negotiating connection');
         this.callbacks.onRoomJoined?.(msg.roomId, msg.code, msg.peerId, msg.peers);
@@ -287,8 +354,10 @@ export class SignalingClient {
         break;
 
       case 'error':
+        this.lastErrorText = msg.message;
         if (msg.code === 'ROOM_NOT_FOUND') {
           this.currentRoomCode = null;
+          this.currentRoomId = null;
         }
         this.callbacks.onError?.(msg.code, msg.message);
         break;
@@ -297,7 +366,15 @@ export class SignalingClient {
 
   public send(msg: SignalingClientMessage) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+      // Attach metadata (id, timestamp, roomId, senderPeerId)
+      const fullMsg: SignalingClientMessage = {
+        id: crypto.randomUUID ? crypto.randomUUID() : 'c-' + Math.random().toString(36).substring(2, 9),
+        timestamp: Date.now(),
+        roomId: this.currentRoomId || undefined,
+        senderPeerId: this.myPeerId || undefined,
+        ...msg,
+      };
+      this.ws.send(JSON.stringify(fullMsg));
     } else {
       console.warn('[CrossDrop Signaling] Cannot send message: WebSocket is not open', msg);
     }
@@ -320,9 +397,11 @@ export class SignalingClient {
 
   public leaveRoom() {
     this.currentRoomCode = null;
+    this.currentRoomId = null;
     this.myPeerId = null;
     this.isIntentionalDisconnect = true;
     clearTimeout(this.reconnectTimer);
+    this.stopHeartbeatPing();
     this.send({ type: 'leave-room' });
     this.notifyState('DISCONNECTED', 'Left room');
   }
@@ -330,9 +409,11 @@ export class SignalingClient {
   public disconnect() {
     this.isIntentionalDisconnect = true;
     this.currentRoomCode = null;
+    this.currentRoomId = null;
     this.myPeerId = null;
     this.abortWaking = true;
     clearTimeout(this.reconnectTimer);
+    this.stopHeartbeatPing();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -340,3 +421,4 @@ export class SignalingClient {
     this.notifyState('DISCONNECTED', 'Disconnected');
   }
 }
+

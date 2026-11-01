@@ -142,8 +142,21 @@ interface HeartbeatWebSocket extends WebSocket {
 
 const wss = new WebSocketServer({ server });
 
+// Message deduplication cache: stores processed message IDs for 60 seconds
+const processedMessageIds = new Map<string, number>();
+const DEDUPLICATION_TTL = 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [msgId, timestamp] of processedMessageIds.entries()) {
+    if (now - timestamp > DEDUPLICATION_TTL) {
+      processedMessageIds.delete(msgId);
+    }
+  }
+}, 30 * 1000);
+
 // WebSocket heartbeat to prevent idle connection dropouts across cloud reverse-proxies
-const WS_HEARTBEAT_INTERVAL = 30000;
+const WS_HEARTBEAT_INTERVAL = 25000;
 const wsHeartbeatTimer = setInterval(() => {
   wss.clients.forEach((client) => {
     const hbClient = client as HeartbeatWebSocket;
@@ -160,9 +173,16 @@ wss.on('close', () => {
   clearInterval(wsHeartbeatTimer);
 });
 
-function send(ws: WebSocket, message: ServerMessage) {
+function send(ws: WebSocket, message: ServerMessage, replyTo?: string, roomId?: string) {
   if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
+    const fullMsg: ServerMessage = {
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      roomId: roomId || message.roomId,
+      replyTo: replyTo || message.replyTo,
+      ...message,
+    };
+    ws.send(JSON.stringify(fullMsg));
   }
 }
 
@@ -207,16 +227,46 @@ wss.on('connection', (ws: WebSocket, req) => {
         return;
       }
 
+      // Deduplication check: prevent processing exact duplicate message IDs within window
+      if (msg.id) {
+        if (processedMessageIds.has(msg.id)) {
+          // Acknowledge duplicate without repeating side effects
+          send(ws, {
+            type: 'ack',
+            ackMessageId: msg.id,
+            replyTo: msg.id,
+          });
+          return;
+        }
+        processedMessageIds.set(msg.id, Date.now());
+      }
+
       switch (msg.type) {
+        case 'ping': {
+          // Liveness ping from client: reply immediately with server time & latency marker
+          send(ws, {
+            type: 'pong',
+            clientTime: msg.clientTime,
+            serverTime: Date.now(),
+            replyTo: msg.id,
+          });
+          break;
+        }
+
         case 'create-room': {
           const { room, peer } = roomManager.createRoom(ws, msg.deviceName);
           console.log(`[Room] Created room ${room.id} with code ${room.code} for peer ${peer.id} (${peer.name})`);
-          send(ws, {
-            type: 'room-created',
-            roomId: room.id,
-            code: room.code,
-            peerId: peer.id,
-          });
+          send(
+            ws,
+            {
+              type: 'room-created',
+              roomId: room.id,
+              code: room.code,
+              peerId: peer.id,
+            },
+            msg.id,
+            room.id
+          );
           break;
         }
 
@@ -224,11 +274,15 @@ wss.on('connection', (ws: WebSocket, req) => {
           const result = roomManager.joinRoom(msg.code, ws, msg.deviceName);
           if (!result.success) {
             console.log(`[Room] Join failed for code ${msg.code}: ${result.error}`);
-            send(ws, {
-              type: 'error',
-              code: result.error,
-              message: result.message,
-            });
+            send(
+              ws,
+              {
+                type: 'error',
+                code: result.error,
+                message: result.message,
+              },
+              msg.id
+            );
             return;
           }
 
@@ -236,24 +290,34 @@ wss.on('connection', (ws: WebSocket, req) => {
           console.log(`[Room] Client ${peer.id} (${peer.name}) joined room ${room.id} (${room.code})`);
 
           // Notify joiner with list of existing peers in the room
-          send(ws, {
-            type: 'room-joined',
-            roomId: room.id,
-            code: room.code,
-            peerId: peer.id,
-            role: 'joiner',
-            peers: existingPeers,
-          });
+          send(
+            ws,
+            {
+              type: 'room-joined',
+              roomId: room.id,
+              code: room.code,
+              peerId: peer.id,
+              role: 'joiner',
+              peers: existingPeers,
+            },
+            msg.id,
+            room.id
+          );
 
           // Broadcast to all other peers in the room that a new peer joined
           const peerSummary = { id: peer.id, name: peer.name, role: peer.role };
           const otherPeers = roomManager.getOtherPeers(ws);
           for (const other of otherPeers) {
-            send(other.ws, {
-              type: 'peer-joined',
-              peer: peerSummary,
-              role: 'peer',
-            });
+            send(
+              other.ws,
+              {
+                type: 'peer-joined',
+                peer: peerSummary,
+                role: 'peer',
+              },
+              undefined,
+              room.id
+            );
           }
           break;
         }
@@ -261,11 +325,15 @@ wss.on('connection', (ws: WebSocket, req) => {
         case 'signal': {
           const senderInfo = roomManager.getPeerForSocket(ws);
           if (!senderInfo) {
-            send(ws, {
-              type: 'error',
-              code: 'ROOM_NOT_FOUND',
-              message: 'Not in a valid room.',
-            });
+            send(
+              ws,
+              {
+                type: 'error',
+                code: 'ROOM_NOT_FOUND',
+                message: 'Not in a valid room.',
+              },
+              msg.id
+            );
             return;
           }
 
@@ -273,57 +341,109 @@ wss.on('connection', (ws: WebSocket, req) => {
             // Targeted signal to a specific peer in the room
             const targetPeer = roomManager.getPeerInRoom(senderInfo.roomId, msg.targetPeerId);
             if (targetPeer) {
-              send(targetPeer.ws, {
-                type: 'signal',
-                senderPeerId: senderInfo.peerId,
-                signalData: msg.signalData,
-              });
+              send(
+                targetPeer.ws,
+                {
+                  type: 'signal',
+                  senderPeerId: senderInfo.peerId,
+                  signalData: msg.signalData,
+                },
+                msg.id,
+                senderInfo.roomId
+              );
+              if (msg.id) {
+                send(ws, { type: 'ack', ackMessageId: msg.id, replyTo: msg.id });
+              }
+            } else {
+              send(
+                ws,
+                {
+                  type: 'error',
+                  code: 'ROOM_NOT_FOUND',
+                  message: `Target device ${msg.targetPeerId} not found in room.`,
+                },
+                msg.id
+              );
             }
           } else {
             // 2-peer fallback: relay to other peer
             const otherPeer = roomManager.getOtherPeer(ws);
             if (otherPeer) {
-              send(otherPeer.ws, {
-                type: 'signal',
-                senderPeerId: senderInfo.peerId,
-                signalData: msg.signalData,
-              });
+              send(
+                otherPeer.ws,
+                {
+                  type: 'signal',
+                  senderPeerId: senderInfo.peerId,
+                  signalData: msg.signalData,
+                },
+                msg.id,
+                senderInfo.roomId
+              );
+              if (msg.id) {
+                send(ws, { type: 'ack', ackMessageId: msg.id, replyTo: msg.id });
+              }
             } else {
-              send(ws, {
-                type: 'error',
-                code: 'ROOM_NOT_FOUND',
-                message: 'No other peer in room to receive signaling data.',
-              });
+              send(
+                ws,
+                {
+                  type: 'error',
+                  code: 'ROOM_NOT_FOUND',
+                  message: 'No other peer in room to receive signaling data.',
+                },
+                msg.id
+              );
             }
           }
           break;
         }
 
         case 'leave-room': {
-          const { leftPeerId, remainingPeers } = roomManager.removeSocket(ws);
+          const { leftPeerId, remainingPeers, roomId } = roomManager.removeSocket(ws);
           if (leftPeerId && remainingPeers.length > 0) {
             for (const remaining of remainingPeers) {
-              send(remaining.ws, {
-                type: 'peer-left',
-                peerId: leftPeerId,
-                reason: 'Peer left the room.',
-              });
-              send(remaining.ws, {
-                type: 'peer-disconnected',
-                peerId: leftPeerId,
-                reason: 'Peer left the room.',
-              });
+              send(
+                remaining.ws,
+                {
+                  type: 'peer-left',
+                  peerId: leftPeerId,
+                  reason: 'Peer left the room.',
+                },
+                undefined,
+                roomId
+              );
+              send(
+                remaining.ws,
+                {
+                  type: 'peer-disconnected',
+                  peerId: leftPeerId,
+                  reason: 'Peer left the room.',
+                },
+                undefined,
+                roomId
+              );
             }
+          }
+          if (msg.id) {
+            send(ws, { type: 'ack', ackMessageId: msg.id, replyTo: msg.id });
           }
           break;
         }
 
+        case 'ack': {
+          // Client acknowledged receipt
+          break;
+        }
+
         default: {
-          send(ws, {
-            type: 'error',
-            code: 'INVALID_MESSAGE',
-            message: 'Unrecognized message type.',
-          });
+          send(
+            ws,
+            {
+              type: 'error',
+              code: 'INVALID_MESSAGE',
+              message: 'Unrecognized message type.',
+            },
+            (msg as any)?.id
+          );
           break;
         }
       }
@@ -339,19 +459,29 @@ wss.on('connection', (ws: WebSocket, req) => {
 
   ws.on('close', () => {
     console.log('[WebSocket] Client disconnected');
-    const { leftPeerId, remainingPeers } = roomManager.removeSocket(ws);
+    const { leftPeerId, remainingPeers, roomId } = roomManager.removeSocket(ws);
     if (leftPeerId && remainingPeers.length > 0) {
       for (const remaining of remainingPeers) {
-        send(remaining.ws, {
-          type: 'peer-left',
-          peerId: leftPeerId,
-          reason: 'Peer disconnected.',
-        });
-        send(remaining.ws, {
-          type: 'peer-disconnected',
-          peerId: leftPeerId,
-          reason: 'Peer disconnected.',
-        });
+        send(
+          remaining.ws,
+          {
+            type: 'peer-left',
+            peerId: leftPeerId,
+            reason: 'Peer disconnected.',
+          },
+          undefined,
+          roomId
+        );
+        send(
+          remaining.ws,
+          {
+            type: 'peer-disconnected',
+            peerId: leftPeerId,
+            reason: 'Peer disconnected.',
+          },
+          undefined,
+          roomId
+        );
       }
     }
   });

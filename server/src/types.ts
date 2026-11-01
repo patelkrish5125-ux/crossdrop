@@ -23,19 +23,34 @@ export interface Room {
   lastActiveAt: number;
 }
 
+// Signaling message base metadata
+export interface SignalingMeta {
+  id?: string;
+  timestamp?: number;
+  roomId?: string;
+  senderPeerId?: string;
+  targetPeerId?: string;
+  replyTo?: string;
+}
+
 // Client -> Server messages
 export type ClientMessage =
-  | { type: 'create-room'; deviceName?: string }
-  | { type: 'join-room'; code: string; deviceName?: string }
-  | { type: 'signal'; targetPeerId?: string; signalData: any }
-  | { type: 'leave-room' };
+  | ({ type: 'create-room'; deviceName?: string } & SignalingMeta)
+  | ({ type: 'join-room'; code: string; deviceName?: string } & SignalingMeta)
+  | ({ type: 'signal'; targetPeerId?: string; signalData: any } & SignalingMeta)
+  | ({ type: 'leave-room' } & SignalingMeta)
+  | ({ type: 'ping'; clientTime?: number } & SignalingMeta)
+  | ({ type: 'ack'; ackMessageId: string } & SignalingMeta);
 
 // Server -> Client messages
 export type ServerMessage =
-  | { type: 'room-created'; roomId: string; code: string; peerId: string }
-  | { type: 'room-joined'; roomId: string; code: string; peerId: string; role: 'joiner'; peers: PeerSummary[] }
-  | { type: 'peer-joined'; peer: PeerSummary; role?: 'peer' }
-  | { type: 'signal'; senderPeerId?: string; signalData: any }
-  | { type: 'peer-left'; peerId: string; reason?: string }
-  | { type: 'peer-disconnected'; peerId?: string; reason?: string }
-  | { type: 'error'; code: 'ROOM_NOT_FOUND' | 'ROOM_FULL' | 'INVALID_CODE' | 'INVALID_MESSAGE'; message: string };
+  | ({ type: 'room-created'; roomId: string; code: string; peerId: string } & SignalingMeta)
+  | ({ type: 'room-joined'; roomId: string; code: string; peerId: string; role: 'joiner'; peers: PeerSummary[] } & SignalingMeta)
+  | ({ type: 'peer-joined'; peer: PeerSummary; role?: 'peer' } & SignalingMeta)
+  | ({ type: 'signal'; senderPeerId?: string; signalData: any } & SignalingMeta)
+  | ({ type: 'peer-left'; peerId: string; reason?: string } & SignalingMeta)
+  | ({ type: 'peer-disconnected'; peerId?: string; reason?: string } & SignalingMeta)
+  | ({ type: 'pong'; clientTime?: number; serverTime: number } & SignalingMeta)
+  | ({ type: 'ack'; ackMessageId: string } & SignalingMeta)
+  | ({ type: 'error'; code: 'ROOM_NOT_FOUND' | 'ROOM_FULL' | 'INVALID_CODE' | 'INVALID_MESSAGE' | 'DUPLICATE_MESSAGE'; message: string } & SignalingMeta);
+

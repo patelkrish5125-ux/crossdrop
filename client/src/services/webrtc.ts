@@ -90,6 +90,13 @@ export async function computeSHA256(data: Blob | ArrayBuffer): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+import type {
+  CandidateDiagnostics,
+  NetworkDiagnosticsData,
+} from '../types/index.ts';
+import { transportManager } from './transport/transportManager.ts';
+import { getSignalingConfig } from '../config.ts';
+
 interface PeerSession {
   peerId: string;
   name: string;
@@ -99,6 +106,20 @@ interface PeerSession {
   state: ConnectionState;
   iceQueue: RTCIceCandidateInit[];
   isRemoteSet: boolean;
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+  reconnectAttempts: number;
+  recoveryTimer: any;
+  statsTimer: any;
+  lastStats: {
+    candidatePath: string;
+    isDirectLan: boolean;
+    rttMs: number | null;
+    localCandidate?: CandidateDiagnostics;
+    remoteCandidate?: CandidateDiagnostics;
+  };
 }
 
 interface IncomingTransferSession {
@@ -156,6 +177,10 @@ export class WebRTCService {
 
   public setLocalPeerId(id: string) {
     this.localPeerId = id;
+    // Update politeness across active peer sessions based on deterministic ID comparison
+    for (const [peerId, session] of this.peers.entries()) {
+      session.polite = this.localPeerId < peerId;
+    }
   }
 
   // --- Multi-Peer Mesh Connection Management ---
@@ -171,30 +196,44 @@ export class WebRTCService {
     }
 
     if (isInitiator) {
-      // Creator or existing peer creates data channel and offer
-      const dc = session.pc.createDataChannel('crossdrop-data', {
-        ordered: true,
-      });
-      this.setupDataChannel(dc, session);
-      session.dc = dc;
-
-      session.pc
-        .createOffer()
-        .then((offer) => session!.pc.setLocalDescription(offer))
-        .then(() => {
-          if (session!.pc.localDescription) {
-            this.sendSignalCallback(session!.pc.localDescription, targetPeerId);
-          }
-        })
-        .catch((err) => {
-          console.error('[WebRTC] Failed to create offer:', err);
-          this.setPeerState(session!, 'ERROR');
+      // Ensure single DataChannel instance for this peer session
+      if (!session.dc || session.dc.readyState === 'closed') {
+        const dc = session.pc.createDataChannel('crossdrop-data', {
+          ordered: true,
         });
+        this.setupDataChannel(dc, session);
+        session.dc = dc;
+      }
+
+      // Perfect Negotiation will handle making the initial offer via negotiationneeded,
+      // or explicitly kick-start offer creation safely
+      if (session.pc.signalingState === 'stable') {
+        session.makingOffer = true;
+        session.pc
+          .createOffer()
+          .then((offer) => session!.pc.setLocalDescription(offer))
+          .then(() => {
+            if (session!.pc.localDescription) {
+              this.sendSignalCallback(session!.pc.localDescription, targetPeerId);
+            }
+          })
+          .catch((err) => {
+            console.error('[WebRTC] Failed to create initial offer:', err);
+            this.setPeerState(session!, 'ERROR');
+          })
+          .finally(() => {
+            if (session) session.makingOffer = false;
+          });
+      }
     }
   }
 
   private createPeerSession(peerId: string): PeerSession {
     const pc = new RTCPeerConnection(RTC_CONFIG);
+    // Politeness: deterministic symmetrical assignment (localPeerId < peerId).
+    // If localPeerId not yet assigned, default to true.
+    const polite = this.localPeerId ? this.localPeerId < peerId : true;
+
     const session: PeerSession = {
       peerId,
       name: 'Remote Device',
@@ -204,6 +243,36 @@ export class WebRTCService {
       state: 'CONNECTING',
       iceQueue: [],
       isRemoteSet: false,
+      polite,
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+      reconnectAttempts: 0,
+      recoveryTimer: null,
+      statsTimer: null,
+      lastStats: {
+        candidatePath: 'Discovering path...',
+        isDirectLan: false,
+        rttMs: null,
+      },
+    };
+
+    // W3C Perfect Negotiation: onnegotiationneeded handler
+    pc.onnegotiationneeded = async () => {
+      try {
+        session.makingOffer = true;
+        await pc.setLocalDescription();
+        if (pc.localDescription) {
+          this.sendSignalCallback(
+            pc.localDescription,
+            peerId === 'default_peer' ? undefined : peerId
+          );
+        }
+      } catch (err) {
+        console.error(`[WebRTC] negotiationneeded error for peer ${peerId}:`, err);
+      } finally {
+        session.makingOffer = false;
+      }
     };
 
     pc.onicecandidate = (event) => {
@@ -218,24 +287,107 @@ export class WebRTCService {
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC] Peer ${peerId} iceConnectionState:`, pc.iceConnectionState);
+      if (pc.iceConnectionState === 'checking') {
+        if (session.state !== 'TRANSFERRING') {
+          this.setPeerState(session, 'CONNECTING_P2P');
+        }
+      } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        if (session.dc && session.dc.readyState === 'open') {
+          this.setPeerState(session, 'CONNECTED');
+        } else {
+          this.setPeerState(session, 'CONNECTING_P2P');
+        }
+      } else if (pc.iceConnectionState === 'disconnected') {
+        this.handleTemporaryDisconnection(session);
+      } else if (pc.iceConnectionState === 'failed') {
+        this.attemptRecovery(session);
+      }
+    };
+
     pc.onconnectionstatechange = () => {
       console.log(`[WebRTC] Peer ${peerId} connectionState:`, pc.connectionState);
-      if (pc.connectionState === 'connected') {
-        this.setPeerState(session, 'CONNECTED');
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        this.setPeerState(session, 'DISCONNECTED');
+      if (pc.connectionState === 'connecting') {
+        if (session.state !== 'TRANSFERRING') {
+          this.setPeerState(session, 'CONNECTING_P2P');
+        }
+      } else if (pc.connectionState === 'connected') {
+        // Only declare ready when DataChannel is actually open
+        if (session.dc && session.dc.readyState === 'open') {
+          session.reconnectAttempts = 0;
+          this.setPeerState(session, 'CONNECTED');
+          this.startStatsPolling(session);
+        } else {
+          this.setPeerState(session, 'CONNECTING_P2P');
+        }
+      } else if (pc.connectionState === 'disconnected') {
+        this.handleTemporaryDisconnection(session);
+      } else if (pc.connectionState === 'failed') {
+        this.attemptRecovery(session);
       } else if (pc.connectionState === 'closed') {
         this.setPeerState(session, 'DISCONNECTED');
       }
     };
 
     pc.ondatachannel = (event) => {
-      console.log(`[WebRTC] Received DataChannel from peer ${peerId}`);
+      console.log(`[WebRTC] Received incoming DataChannel from peer ${peerId}`);
       this.setupDataChannel(event.channel, session);
       session.dc = event.channel;
     };
 
     return session;
+  }
+
+  private handleTemporaryDisconnection(session: PeerSession) {
+    console.log(`[WebRTC] Peer ${session.peerId} connection temporarily dropped. Starting recovery timer...`);
+    this.setPeerState(session, 'RECOVERING');
+
+    clearTimeout(session.recoveryTimer);
+    session.recoveryTimer = setTimeout(() => {
+      if (session.pc.connectionState === 'disconnected' || session.pc.iceConnectionState === 'disconnected') {
+        this.attemptRecovery(session);
+      }
+    }, 2000);
+  }
+
+  public attemptRecovery(session: PeerSession) {
+    clearTimeout(session.recoveryTimer);
+
+    if (session.reconnectAttempts >= 3) {
+      console.warn(`[WebRTC] Peer ${session.peerId} exceeded maximum ICE recovery attempts.`);
+      this.setPeerState(session, 'FAILED');
+      return;
+    }
+
+    session.reconnectAttempts++;
+    console.log(
+      `[WebRTC] Attempting ICE restart for peer ${session.peerId} (attempt ${session.reconnectAttempts}/3)...`
+    );
+    this.setPeerState(session, 'RECOVERING');
+
+    try {
+      if (typeof (session.pc as any).restartIce === 'function') {
+        (session.pc as any).restartIce();
+      } else {
+        session.pc
+          .createOffer({ iceRestart: true })
+          .then((offer) => session.pc.setLocalDescription(offer))
+          .then(() => {
+            if (session.pc.localDescription) {
+              this.sendSignalCallback(
+                session.pc.localDescription,
+                session.peerId === 'default_peer' ? undefined : session.peerId
+              );
+            }
+          })
+          .catch((err) => {
+            console.warn('[WebRTC] Fallback createOffer with iceRestart failed:', err);
+          });
+      }
+    } catch (e) {
+      console.warn('[WebRTC] Exception during ICE restart:', e);
+    }
   }
 
   private setupDataChannel(dc: RTCDataChannel, session: PeerSession) {
@@ -244,15 +396,19 @@ export class WebRTCService {
 
     dc.onopen = () => {
       console.log(`[WebRTC] DataChannel opened for peer ${session.peerId}!`);
+      session.reconnectAttempts = 0;
       this.setPeerState(session, 'CONNECTED');
       this.sendPeerInfo(session);
+      this.startStatsPolling(session);
       // Immediately process any queued waiting files
       this.processQueue();
     };
 
     dc.onclose = () => {
       console.log(`[WebRTC] DataChannel closed for peer ${session.peerId}`);
-      this.setPeerState(session, 'DISCONNECTED');
+      if (session.state !== 'DISCONNECTED') {
+        this.handleTemporaryDisconnection(session);
+      }
     };
 
     dc.onerror = (err) => {
@@ -264,7 +420,82 @@ export class WebRTCService {
     };
   }
 
-  public handleSignal(signalData: any, senderPeerId?: string): void {
+  /**
+   * Real-time WebRTC diagnostics and candidate-pair inspection using pc.getStats()
+   */
+  private startStatsPolling(session: PeerSession) {
+    if (session.statsTimer) clearInterval(session.statsTimer);
+
+    const pollStats = async () => {
+      if (session.pc.connectionState !== 'connected' && session.pc.iceConnectionState !== 'connected') {
+        return;
+      }
+
+      try {
+        const stats = await session.pc.getStats();
+        let selectedPair: any = null;
+
+        stats.forEach((report) => {
+          if (
+            report.type === 'candidate-pair' &&
+            (report.state === 'succeeded' || report.nominated === true || report.selected === true)
+          ) {
+            selectedPair = report;
+          }
+        });
+
+        if (selectedPair) {
+          const localCand = stats.get(selectedPair.localCandidateId);
+          const remoteCand = stats.get(selectedPair.remoteCandidateId);
+
+          const localType = (localCand?.candidateType || 'unknown').toLowerCase();
+          const remoteType = (remoteCand?.candidateType || 'unknown').toLowerCase();
+
+          const isDirectLan = localType === 'host' && remoteType === 'host';
+          const isRelay = localType === 'relay' || remoteType === 'relay';
+
+          let pathLabel = 'STUN Direct (Server Reflexive NAT P2P)';
+          if (isDirectLan) {
+            pathLabel = 'Direct Wi-Fi / Local LAN (Host)';
+          } else if (isRelay) {
+            pathLabel = 'TURN Relay (Relayed Traffic)';
+          }
+
+          const rttMs = selectedPair.currentRoundTripTime
+            ? Math.round(selectedPair.currentRoundTripTime * 1000)
+            : selectedPair.totalRoundTripTime && selectedPair.responsesReceived
+            ? Math.round((selectedPair.totalRoundTripTime / selectedPair.responsesReceived) * 1000)
+            : null;
+
+          session.lastStats = {
+            candidatePath: pathLabel,
+            isDirectLan,
+            rttMs,
+            localCandidate: {
+              type: localType as any,
+              protocol: localCand?.protocol || 'udp',
+              ip: localCand?.address || localCand?.ip,
+              port: localCand?.port,
+            },
+            remoteCandidate: {
+              type: remoteType as any,
+              protocol: remoteCand?.protocol || 'udp',
+              ip: remoteCand?.address || remoteCand?.ip,
+              port: remoteCand?.port,
+            },
+          };
+        }
+      } catch {}
+    };
+
+    session.statsTimer = setInterval(pollStats, 2500);
+    pollStats(); // Initial check immediately
+  }
+
+  /**
+   * Robust signaling handler implementing the W3C Perfect Negotiation Pattern.
+   */
+  public async handleSignal(signalData: any, senderPeerId?: string): Promise<void> {
     const peerKey = senderPeerId || this.defaultPeerId || 'default_peer';
     let session = this.peers.get(peerKey);
 
@@ -274,51 +505,85 @@ export class WebRTCService {
       if (!this.defaultPeerId) this.defaultPeerId = peerKey;
     }
 
-    if (signalData.type === 'offer') {
-      session.pc
-        .setRemoteDescription(new RTCSessionDescription(signalData))
-        .then(() => {
-          session!.isRemoteSet = true;
-          this.flushIceCandidates(session!);
-          return session!.pc.createAnswer();
-        })
-        .then((answer) => session!.pc.setLocalDescription(answer))
-        .then(() => {
-          if (session!.pc.localDescription) {
-            this.sendSignalCallback(session!.pc.localDescription, senderPeerId);
+    const isOffer = signalData.type === 'offer' || signalData.sdpType === 'offer';
+    const isAnswer = signalData.type === 'answer' || signalData.sdpType === 'answer';
+
+    if (isOffer || isAnswer) {
+      const description = new RTCSessionDescription({
+        type: (signalData.sdpType || signalData.type) as RTCSdpType,
+        sdp: signalData.sdp || signalData.description,
+      });
+
+      // Glare check: check whether simultaneous offers collided
+      const offerCollision = isOffer && (session.makingOffer || session.pc.signalingState !== 'stable');
+      session.ignoreOffer = !session.polite && offerCollision;
+
+      if (session.ignoreOffer) {
+        console.warn(`[WebRTC] Glare collision: Impolite peer ignoring conflicting offer from ${peerKey}`);
+        return;
+      }
+
+      session.isSettingRemoteAnswerPending = isAnswer;
+
+      try {
+        if (offerCollision && session.polite) {
+          console.log(`[WebRTC] Glare collision: Polite peer rolling back to accept offer from ${peerKey}`);
+          await session.pc.setLocalDescription({ type: 'rollback' });
+        }
+
+        await session.pc.setRemoteDescription(description);
+        session.isRemoteSet = true;
+        session.isSettingRemoteAnswerPending = false;
+
+        // Drain queued ICE candidates received before remote description was installed
+        await this.flushIceCandidates(session);
+
+        if (isOffer) {
+          await session.pc.setLocalDescription();
+          if (session.pc.localDescription) {
+            this.sendSignalCallback(session.pc.localDescription, senderPeerId);
           }
-        })
-        .catch((err) => {
-          console.error('[WebRTC] Error handling offer:', err);
-          this.setPeerState(session!, 'ERROR');
-        });
-    } else if (signalData.type === 'answer') {
-      session.pc
-        .setRemoteDescription(new RTCSessionDescription(signalData))
-        .then(() => {
-          session!.isRemoteSet = true;
-          this.flushIceCandidates(session!);
-        })
-        .catch((err) => {
-          console.error('[WebRTC] Error handling answer:', err);
-          this.setPeerState(session!, 'ERROR');
-        });
-    } else if (signalData.type === 'candidate' && signalData.candidate) {
-      if (session.isRemoteSet) {
-        session.pc.addIceCandidate(new RTCIceCandidate(signalData.candidate)).catch((err) => {
-          console.error('[WebRTC] Error adding ICE candidate:', err);
-        });
+        }
+      } catch (err: any) {
+        console.error(`[WebRTC] Error handling SDP description from ${peerKey}:`, err);
+        session.isSettingRemoteAnswerPending = false;
+        this.setPeerState(session, 'ERROR');
+      }
+    } else if (signalData.type === 'candidate') {
+      const candidateInit = signalData.candidate;
+      if (!candidateInit || candidateInit.candidate === '') {
+        // End-of-candidates notification
+        return;
+      }
+
+      // Safe candidate queuing: queue if remote description is not ready yet
+      if (!session.isRemoteSet || session.isSettingRemoteAnswerPending || !session.pc.remoteDescription) {
+        session.iceQueue.push(candidateInit);
       } else {
-        session.iceQueue.push(signalData.candidate);
+        try {
+          await session.pc.addIceCandidate(new RTCIceCandidate(candidateInit));
+        } catch (err: any) {
+          if (!session.ignoreOffer) {
+            console.warn('[WebRTC] Exception adding ICE candidate:', err);
+          }
+        }
       }
     }
   }
 
-  private flushIceCandidates(session: PeerSession) {
+  private async flushIceCandidates(session: PeerSession) {
+    if (!session.pc.remoteDescription) return;
+
     while (session.iceQueue.length > 0) {
       const cand = session.iceQueue.shift();
-      if (cand) {
-        session.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+      if (cand && cand.candidate) {
+        try {
+          await session.pc.addIceCandidate(new RTCIceCandidate(cand));
+        } catch (err: any) {
+          if (!session.ignoreOffer) {
+            console.warn('[WebRTC] Error adding flushed ICE candidate:', err);
+          }
+        }
       }
     }
   }
@@ -334,7 +599,7 @@ export class WebRTCService {
       id: p.peerId,
       name: p.name,
       role: p.role,
-      status: p.state === 'CONNECTED' ? 'connected' : p.state === 'CONNECTING' ? 'connecting' : 'disconnected',
+      status: p.state === 'CONNECTED' ? 'connected' : p.state === 'CONNECTING' || p.state === 'CONNECTING_P2P' ? 'connecting' : 'disconnected',
       connectionState: p.state,
     }));
     this.callbacks.onPeerListUpdate?.(list);
@@ -359,6 +624,8 @@ export class WebRTCService {
     const session = this.peers.get(peerId);
     if (session) {
       try {
+        clearTimeout(session.recoveryTimer);
+        clearInterval(session.statsTimer);
         session.dc?.close();
         session.pc.close();
       } catch {}
@@ -369,6 +636,7 @@ export class WebRTCService {
     }
     this.notifyPeerList();
   }
+
 
   private sendPeerInfo(session: PeerSession) {
     if (session.dc && session.dc.readyState === 'open') {
@@ -1162,6 +1430,38 @@ export class WebRTCService {
   public async sendFiles(files: File[], targetPeerId?: string): Promise<void> {
     this.addFilesToQueue(files, targetPeerId);
   }
+
+  public getDiagnostics(targetPeerId?: string): NetworkDiagnosticsData {
+    const peerKey = targetPeerId || this.defaultPeerId || Array.from(this.peers.keys())[0];
+    const session = peerKey ? this.peers.get(peerKey) : undefined;
+    const btCap = transportManager.getBluetoothCapability();
+
+    const activeTransfers = this.queue.filter((q) => q.status === 'transferring' || q.status === 'receiving');
+    const totalSpeed = activeTransfers.reduce((acc, q) => acc + q.speedBytesPerSec, 0);
+
+    return {
+      signalingState: session?.state || 'DISCONNECTED',
+      signalingUrl: getSignalingConfig().url,
+      signalingLatencyMs: null,
+      peerConnectionState: session ? session.pc.connectionState : 'disconnected',
+      iceConnectionState: session ? session.pc.iceConnectionState : 'disconnected',
+      iceGatheringState: session ? session.pc.iceGatheringState : 'new',
+      dataChannelState: session?.dc ? session.dc.readyState : 'closed',
+      bufferedAmountBytes: session?.dc ? session.dc.bufferedAmount : 0,
+      selectedCandidatePath: session?.lastStats.candidatePath || 'Discovering path...',
+      isDirectLan: Boolean(session?.lastStats.isDirectLan),
+      localCandidate: session?.lastStats.localCandidate,
+      remoteCandidate: session?.lastStats.remoteCandidate,
+      roundTripTimeMs: session?.lastStats.rttMs ?? null,
+      reconnectAttempts: session?.reconnectAttempts || 0,
+      lastError: null,
+      bluetoothSupported: btCap.isSupportedInBrowser,
+      bluetoothStatus: btCap.statusText,
+      speedBytesPerSec: totalSpeed,
+      totalTransferredBytes: this.totalTransferredSessionBytes,
+    };
+  }
+
 
   public cleanup(): void {
     this.cancelAllTransfers('Session closed', false);

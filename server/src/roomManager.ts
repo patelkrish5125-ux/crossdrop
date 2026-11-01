@@ -130,16 +130,22 @@ export class RoomManager {
   }
 
   /**
-   * Get a specific peer in the room by peerId
+   * Get a specific peer in the room by peerId (filters out dead sockets)
    */
   public getPeerInRoom(roomId: string, peerId: string): RoomPeer | null {
     const room = this.roomsById.get(roomId);
     if (!room) return null;
-    return room.peers.find((p) => p.id === peerId) || null;
+    const peer = room.peers.find((p) => p.id === peerId);
+    if (!peer) return null;
+    if (peer.ws.readyState !== 1 /* OPEN */) {
+      this.removeSocket(peer.ws);
+      return null;
+    }
+    return peer;
   }
 
   /**
-   * Get the other peer in the room (for 2-peer backward compatibility)
+   * Get the other peer in the room (for 2-peer backward compatibility, filters dead sockets)
    */
   public getOtherPeer(ws: WebSocket): RoomPeer | null {
     const info = this.peerMap.get(ws);
@@ -149,11 +155,12 @@ export class RoomManager {
     if (!room) return null;
 
     room.lastActiveAt = Date.now();
-    return room.peers.find((p) => p.id !== info.peerId) || null;
+    const other = room.peers.find((p) => p.id !== info.peerId && p.ws.readyState === 1);
+    return other || null;
   }
 
   /**
-   * Get all other peers in the room
+   * Get all other peers in the room (filters dead sockets)
    */
   public getOtherPeers(ws: WebSocket): RoomPeer[] {
     const info = this.peerMap.get(ws);
@@ -163,7 +170,7 @@ export class RoomManager {
     if (!room) return [];
 
     room.lastActiveAt = Date.now();
-    return room.peers.filter((p) => p.id !== info.peerId);
+    return room.peers.filter((p) => p.id !== info.peerId && p.ws.readyState === 1);
   }
 
   /**
@@ -187,6 +194,22 @@ export class RoomManager {
   }
 
   /**
+   * Look up room by code
+   */
+  public getRoomByCode(code: string): Room | null {
+    const roomId = this.roomIdByCode.get(code.trim());
+    if (!roomId) return null;
+    return this.roomsById.get(roomId) || null;
+  }
+
+  /**
+   * Look up room by ID
+   */
+  public getRoomById(roomId: string): Room | null {
+    return this.roomsById.get(roomId) || null;
+  }
+
+  /**
    * Remove a socket when disconnected or leaving
    */
   public removeSocket(ws: WebSocket): {
@@ -203,7 +226,7 @@ export class RoomManager {
     if (!room) return { remainingPeers: [] };
 
     const leftPeerId = info.peerId;
-    const remainingPeers = room.peers.filter((p) => p.id !== leftPeerId);
+    const remainingPeers = room.peers.filter((p) => p.id !== leftPeerId && p.ws.readyState === 1);
     const notifiedPeer = remainingPeers[0] || undefined;
 
     room.peers = remainingPeers;
@@ -218,7 +241,7 @@ export class RoomManager {
   }
 
   /**
-   * Cleanup inactive rooms (older than 30 minutes)
+   * Cleanup inactive rooms (older than maxAgeMs, default 30 minutes)
    */
   public cleanupInactiveRooms(maxAgeMs = 30 * 60 * 1000): number {
     const now = Date.now();
@@ -231,6 +254,8 @@ export class RoomManager {
             const msg: ServerMessage = {
               type: 'peer-disconnected',
               reason: 'Room expired due to inactivity.',
+              roomId,
+              peerId: peer.id,
             };
             peer.ws.send(JSON.stringify(msg));
           } catch {
@@ -251,3 +276,4 @@ export class RoomManager {
     return this.roomsById.size;
   }
 }
+

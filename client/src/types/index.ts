@@ -5,10 +5,13 @@ export type ConnectionState =
   | 'SIGNALING_CONNECTED'
   | 'WAITING_FOR_PEER'
   | 'NEGOTIATING'
+  | 'CONNECTING_P2P'
   | 'CONNECTED'
   | 'TRANSFERRING'
-  | 'COMPLETED'
+  | 'RECOVERING'
   | 'RECONNECTING'
+  | 'COMPLETED'
+  | 'FAILED'
   | 'ERROR';
 
 export type TransferStatus =
@@ -122,17 +125,60 @@ export interface SessionHistoryItem {
   integrityVerified: boolean;
 }
 
+export interface CandidateDiagnostics {
+  type: 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown';
+  protocol: string;
+  ip?: string;
+  port?: number;
+}
+
+export interface NetworkDiagnosticsData {
+  signalingState: ConnectionState;
+  signalingUrl: string;
+  signalingLatencyMs: number | null;
+  peerConnectionState: RTCPeerConnectionState | 'disconnected';
+  iceConnectionState: RTCIceConnectionState | 'disconnected';
+  iceGatheringState: RTCIceGatheringState | 'new';
+  dataChannelState: RTCDataChannelState | 'closed';
+  bufferedAmountBytes: number;
+  selectedCandidatePath: string; // e.g. "Direct Wi-Fi / LAN (Host)"
+  isDirectLan: boolean;
+  localCandidate?: CandidateDiagnostics;
+  remoteCandidate?: CandidateDiagnostics;
+  roundTripTimeMs: number | null;
+  reconnectAttempts: number;
+  lastError: string | null;
+  bluetoothSupported: boolean;
+  bluetoothStatus: string;
+  speedBytesPerSec: number;
+  totalTransferredBytes: number;
+}
+
+export interface SignalingMeta {
+  id?: string;
+  timestamp?: number;
+  roomId?: string;
+  senderPeerId?: string;
+  targetPeerId?: string;
+  replyTo?: string;
+}
+
 export type SignalingServerMessage =
-  | { type: 'room-created'; roomId: string; code: string; peerId?: string }
-  | { type: 'room-joined'; roomId: string; code: string; peerId?: string; role: 'joiner'; peers?: Array<{ id: string; name: string; role: 'creator' | 'joiner' }> }
-  | { type: 'peer-joined'; peer?: { id: string; name: string; role: 'creator' | 'joiner' }; role?: 'peer' }
-  | { type: 'signal'; senderPeerId?: string; signalData: any }
-  | { type: 'peer-left'; peerId: string; reason?: string }
-  | { type: 'peer-disconnected'; peerId?: string; reason?: string }
-  | { type: 'error'; code: 'ROOM_NOT_FOUND' | 'ROOM_FULL' | 'INVALID_CODE' | 'INVALID_MESSAGE'; message: string };
+  | ({ type: 'room-created'; roomId: string; code: string; peerId?: string } & SignalingMeta)
+  | ({ type: 'room-joined'; roomId: string; code: string; peerId?: string; role: 'joiner'; peers?: Array<{ id: string; name: string; role: 'creator' | 'joiner' }> } & SignalingMeta)
+  | ({ type: 'peer-joined'; peer?: { id: string; name: string; role: 'creator' | 'joiner' }; role?: 'peer' } & SignalingMeta)
+  | ({ type: 'signal'; senderPeerId?: string; signalData: any } & SignalingMeta)
+  | ({ type: 'peer-left'; peerId: string; reason?: string } & SignalingMeta)
+  | ({ type: 'peer-disconnected'; peerId?: string; reason?: string } & SignalingMeta)
+  | ({ type: 'pong'; clientTime?: number; serverTime: number } & SignalingMeta)
+  | ({ type: 'ack'; ackMessageId: string } & SignalingMeta)
+  | ({ type: 'error'; code: 'ROOM_NOT_FOUND' | 'ROOM_FULL' | 'INVALID_CODE' | 'INVALID_MESSAGE' | 'DUPLICATE_MESSAGE'; message: string } & SignalingMeta);
 
 export type SignalingClientMessage =
-  | { type: 'create-room'; deviceName?: string }
-  | { type: 'join-room'; code: string; deviceName?: string }
-  | { type: 'signal'; targetPeerId?: string; signalData: any }
-  | { type: 'leave-room' };
+  | ({ type: 'create-room'; deviceName?: string } & SignalingMeta)
+  | ({ type: 'join-room'; code: string; deviceName?: string } & SignalingMeta)
+  | ({ type: 'signal'; targetPeerId?: string; signalData: any } & SignalingMeta)
+  | ({ type: 'leave-room' } & SignalingMeta)
+  | ({ type: 'ping'; clientTime?: number } & SignalingMeta)
+  | ({ type: 'ack'; ackMessageId: string } & SignalingMeta);
+

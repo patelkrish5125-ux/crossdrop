@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import type {
   ConnectionState,
+  NetworkDiagnosticsData,
   ReceivedFile,
   RemotePeer,
   SessionHistoryItem,
@@ -13,6 +14,7 @@ import { getSignalingConfig } from './config.ts';
 import { generateQRCodeSVG } from './utils/qr.ts';
 import { extractDroppedFiles } from './utils/fileDrop.ts';
 import { createZipBlob } from './utils/zip.ts';
+import { NetworkDiagnostics } from './components/NetworkDiagnostics.tsx';
 
 type AppStep =
   | 'home'
@@ -103,14 +105,43 @@ export default function App() {
   // Folder transfer support detection
   const isFolderSupported = typeof window !== 'undefined' && 'webkitdirectory' in document.createElement('input');
 
+  // Network diagnostics panel state
+  const [isDiagOpen, setIsDiagOpen] = useState<boolean>(false);
+  const [diagData, setDiagData] = useState<NetworkDiagnosticsData | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const signalingRef = useRef<SignalingClient | null>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
 
+  const updateDiagnostics = () => {
+    if (webrtcRef.current) {
+      const data = webrtcRef.current.getDiagnostics(selectedTargetPeerId || undefined);
+      if (signalingRef.current) {
+        data.signalingLatencyMs = signalingRef.current.latency;
+        data.reconnectAttempts = signalingRef.current.reconnectCount;
+        if (signalingRef.current.lastError) data.lastError = signalingRef.current.lastError;
+      }
+      setDiagData(data);
+    }
+  };
+
+  const handleOpenDiagnostics = () => {
+    updateDiagnostics();
+    setIsDiagOpen(true);
+  };
+
+  useEffect(() => {
+    if (!isDiagOpen) return;
+    updateDiagnostics();
+    const timer = setInterval(updateDiagnostics, 1500);
+    return () => clearInterval(timer);
+  }, [isDiagOpen, selectedTargetPeerId]);
+
   const handleDeviceNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newName = e.target.value;
     setDeviceName(newName);
+
     if (typeof window !== 'undefined') {
       localStorage.setItem('crossdrop_device_name', newName);
     }
@@ -511,25 +542,49 @@ export default function App() {
         </h1>
         <p className="app-subtitle">High-speed, multi-device peer-to-peer file sharing</p>
 
-        {/* Device Name Banner */}
-        <div className="device-bar" style={{ marginTop: '0.75rem' }}>
-          <div className="device-label">
-            <span>💻</span>
-            <span>Your Device:</span>
-            <input
-              type="text"
-              className="device-input-inline"
-              value={deviceName}
-              onChange={handleDeviceNameChange}
-              title="Click to change your device name"
-              maxLength={24}
-            />
-          </div>
-          {roomCode && (
-            <div className="peer-badge" title="Room Code">
-              <span>🔑 Room: {roomCode}</span>
+        {/* Device Name Banner & Diagnostics Button */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.75rem', width: '100%', flexWrap: 'wrap' }}>
+          <div className="device-bar" style={{ marginTop: 0, flex: 1, minWidth: '220px' }}>
+            <div className="device-label">
+              <span>💻</span>
+              <span>Your Device:</span>
+              <input
+                type="text"
+                className="device-input-inline"
+                value={deviceName}
+                onChange={handleDeviceNameChange}
+                title="Click to change your device name"
+                maxLength={24}
+              />
             </div>
-          )}
+            {roomCode && (
+              <div className="peer-badge" title="Room Code">
+                <span>🔑 Room: {roomCode}</span>
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="btn-icon-sm"
+            style={{
+              padding: '0.45rem 0.85rem',
+              borderRadius: '6px',
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.35rem',
+              background: 'rgba(59, 130, 246, 0.1)',
+              border: '1px solid rgba(59, 130, 246, 0.3)',
+              color: '#60a5fa',
+              cursor: 'pointer',
+              height: '38px',
+            }}
+            onClick={handleOpenDiagnostics}
+            title="Open network & transport diagnostics panel"
+          >
+            📶 Diagnostics
+          </button>
         </div>
       </header>
 
@@ -539,7 +594,7 @@ export default function App() {
           className={`status-banner ${
             connectionState === 'CONNECTED' || connectionState === 'COMPLETED'
               ? 'connected'
-              : connectionState === 'ERROR'
+              : connectionState === 'ERROR' || connectionState === 'FAILED'
               ? 'error'
               : 'connecting'
           }`}
@@ -553,11 +608,17 @@ export default function App() {
               : connectionState === 'WAITING_FOR_PEER'
               ? 'Waiting for devices to connect...'
               : connectionState === 'NEGOTIATING'
-              ? 'Establishing P2P link with devices...'
+              ? 'Negotiating WebRTC offer/answer...'
+              : connectionState === 'CONNECTING_P2P'
+              ? 'Connecting peer-to-peer (ICE candidate checking)...'
+              : connectionState === 'RECOVERING'
+              ? '🔄 Link temporarily dropped. Attempting WebRTC ICE recovery...'
               : connectionState === 'RECONNECTING'
               ? '🔄 Reconnecting to signaling server...'
               : connectionState === 'CONNECTING'
               ? 'Connecting to server...'
+              : connectionState === 'FAILED'
+              ? '⚠️ Connection failed. Please rejoin or create a new room.'
               : connectionState}
           </span>
         </div>
@@ -1151,6 +1212,15 @@ export default function App() {
             </button>
           </div>
         </section>
+      )}
+
+      {/* Network & Transport Diagnostics Modal */}
+      {diagData && (
+        <NetworkDiagnostics
+          data={diagData}
+          isOpen={isDiagOpen}
+          onClose={() => setIsDiagOpen(false)}
+        />
       )}
     </main>
   );
